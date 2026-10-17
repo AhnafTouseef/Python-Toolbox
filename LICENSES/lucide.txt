@@ -1,0 +1,7 @@
+Lucide is licensed under the ISC License.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+This repository includes a bundled subset of Lucide-style SVG icons for local rendering in the Python Toolbox application. The icons are used in accordance with the Lucide license terms.
