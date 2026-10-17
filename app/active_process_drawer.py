@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QPoint
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtGui import QPainter, QColor, QFont
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QFrame
 
 
@@ -24,7 +24,10 @@ class ActiveProcessDrawer(QWidget):
 
         layout = QVBoxLayout(self._panel)
         title = QLabel("Active Processes")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title.setFont(title_font)
+        title.setStyleSheet("font-weight: 600;")
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.hide_drawer)
 

@@ -28,11 +28,19 @@ class ProcessManager(QObject):
         process.setWorkingDirectory(str(instance.tool_dir))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
 
+        env = process.processEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
+        process.setProcessEnvironment(env)
+
+        launch_args = [str(main_script)]
+        if Path(interpreter).name.lower().startswith("python") or interpreter.lower().endswith("python.exe"):
+            launch_args.insert(0, "-u")
+
         def on_ready_read() -> None:
             data = process.readAllStandardOutput()
             if data:
                 text = data.data().decode("utf-8", errors="replace")
-                instance.append_output(text)
                 self.output_received.emit(instance.instance_id, text)
 
         def on_finished(code: int, status: QProcess.ExitStatus) -> None:
@@ -52,7 +60,7 @@ class ProcessManager(QObject):
         process.readyReadStandardOutput.connect(on_ready_read)
         process.finished.connect(on_finished)
 
-        process.start(interpreter, [str(main_script)])
+        process.start(interpreter, launch_args)
         if not process.waitForStarted(2000):
             instance.status = "Launch failed"
             self.process_failed.emit(instance.instance_id, f"Could not launch {main_script.name}.")

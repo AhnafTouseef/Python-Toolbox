@@ -12,7 +12,7 @@ class ToolInstance:
     tool_dir: Path
     interpreter: str
     status: str = "Idle"
-    output: List[str] = field(default_factory=list)
+    output: str = ""
     input_text: str = ""
     run_count: int = 0
     process_id: Optional[str] = None
@@ -20,10 +20,46 @@ class ToolInstance:
     def append_output(self, text: str) -> None:
         if not text:
             return
-        lines = text.splitlines()
-        if lines:
-            for line in lines:
-                self.output.append(line)
+        self.output += text
+
+    def rendered_output(self) -> str:
+        if not self.output:
+            return ""
+
+        if "\r" not in self.output and "\b" not in self.output:
+            return self.output
+
+        lines = [""]
+        current_line = 0
+        cursor_col = 0
+
+        for ch in self.output:
+            if ch == "\r":
+                cursor_col = 0
+            elif ch == "\n":
+                current_line += 1
+                if current_line >= len(lines):
+                    lines.append("")
+                cursor_col = 0
+            elif ch == "\b":
+                if cursor_col > 0:
+                    cursor_col -= 1
+                    line = lines[current_line]
+                    if cursor_col < len(line):
+                        lines[current_line] = line[:cursor_col] + line[cursor_col + 1:]
+                    elif line:
+                        lines[current_line] = line[:-1]
+            else:
+                while current_line >= len(lines):
+                    lines.append("")
+                line = lines[current_line]
+                if cursor_col <= len(line):
+                    lines[current_line] = line[:cursor_col] + ch + line[cursor_col:]
+                else:
+                    lines[current_line] = line + (" " * (cursor_col - len(line))) + ch
+                cursor_col += 1
+
+        return "\n".join(lines)
 
 
 class SessionManager:

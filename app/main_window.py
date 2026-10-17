@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QStackedLayout, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTabBar, QMessageBox, QToolButton
 
 from app.active_process_drawer import ActiveProcessDrawer
@@ -99,6 +105,28 @@ class MainWindow(QMainWindow):
 
         self.bind_drawer_button()
 
+        self._terminal_refresh_timer = QTimer(self)
+        self._terminal_refresh_timer.setInterval(5000)
+        self._terminal_refresh_timer.timeout.connect(self.refresh_snapshot)
+
+        self.tab_bar.setStyleSheet("QTabBar::tab { background: #1F2937; border: 1px solid #2D3748; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 8px 12px; color: #E5E7EB; } QTabBar::tab:selected { background: #1B2230; border-color: #3B82F6; } QTabBar::close-button { image: none; margin: 4px; }")
+        tab_font = QFont()
+        tab_font.setPointSize(10)
+        self.tab_bar.setFont(tab_font)
+
+        self.active_process_button = QToolButton(self)
+        self.active_process_button.setToolTip("Active processes")
+        self.active_process_button.setText("◉")
+        self.active_process_button.setFixedSize(32, 32)
+        button_font = QFont()
+        button_font.setPointSize(16)
+        self.active_process_button.setFont(button_font)
+        self.active_process_button.setStyleSheet(
+            "QToolButton { border: 1px solid #334155; border-radius: 8px; background: #111827; color: #e2e8f0; } "
+            "QToolButton:hover { background: #1f2937; border-color: #475569; } "
+            "QToolButton:pressed { background: #0f172a; }"
+        )
+
     def showEvent(self, event):
         super().showEvent(event)
         if not self._library_load_timer.isActive():
@@ -110,7 +138,7 @@ class MainWindow(QMainWindow):
         self.active_process_button.setText("◉")
         self.active_process_button.setFixedSize(32, 32)
         self.active_process_button.setStyleSheet(
-            "QToolButton { border: 1px solid #334155; border-radius: 8px; background: #111827; color: #e2e8f0; font-size: 16px; } "
+            "QToolButton { border: 1px solid #334155; border-radius: 8px; background: #111827; color: #e2e8f0; } "
             "QToolButton:hover { background: #1f2937; border-color: #475569; } "
             "QToolButton:pressed { background: #0f172a; }"
         )
@@ -169,6 +197,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Python Toolbox - {instance.tool_name}")
         self.stack.setCurrentIndex(1)
         self.update_terminal_for_instance(instance)
+        self._terminal_refresh_timer.start()
         if not self._refreshing_tabs:
             self.refresh_tabs()
 
@@ -254,38 +283,37 @@ class MainWindow(QMainWindow):
         if not text:
             return
         self.process_manager.write_stdin(instance, text)
+        instance.input_text = text
         self.terminal.input_line.clear()
-        self.terminal.append_text(f"{text}\n")
 
     def clear_output(self):
         instance = self.session_manager.get_active_instance()
         if instance is not None:
-            instance.output.clear()
+            instance.output = ""
         self.terminal.output.clear()
-
-    def return_to_library(self):
-        self.stack.setCurrentIndex(0)
-        self.setWindowTitle("Python Toolbox")
-        self.refresh_drawer()
 
     def update_terminal_for_instance(self, instance: ToolInstance):
         self.terminal.output.clear()
         if instance.output:
-            self.terminal.output.insertPlainText("\n".join(instance.output))
+            self.terminal.output.insertPlainText("".join(instance.output))
         self.terminal.set_status(instance.status)
         self.terminal.input_line.setText(instance.input_text)
 
-    def refresh_drawer(self):
-        self.drawer.clear()
-        for instance_id, instance in self.session_manager.instances.items():
-            if instance.status in {"Running", "Starting", "Idle"}:
-                self.drawer.add_running_item(instance_id, f"{instance.tool_name} ({instance.instance_id[:8]})")
+    def refresh_snapshot(self):
+        """Render the current terminal screen state, not a full raw log dump."""
+        instance = self.session_manager.get_active_instance()
+        if instance is None:
+            return
 
-    def open_instance_from_drawer(self, item):
-        instance_id = item.data(Qt.ItemDataRole.UserRole)
-        if instance_id:
-            self.show_workspace_for_instance(instance_id)
-            self.drawer.hide()
+        text = instance.rendered_output()
+        self.terminal.output.clear()
+        if text:
+            self.terminal.output.insertPlainText(text)
+        self.terminal.output.ensureCursorVisible()
+        self.terminal.set_status(instance.status)
+
+    def _refresh_terminal_snapshot(self):
+        self.refresh_snapshot()
 
     def handle_process_output(self, instance_id: str, text: str):
         instance = self.session_manager.get_instance(instance_id)
@@ -293,7 +321,7 @@ class MainWindow(QMainWindow):
             return
         instance.append_output(text)
         if self.session_manager.active_instance_id == instance_id:
-            self.terminal.append_text(text)
+            self.refresh_snapshot()
             self.terminal.set_status(instance.status)
 
     def handle_process_status(self, instance_id: str, status: str):
@@ -331,6 +359,7 @@ class MainWindow(QMainWindow):
             self.drawer.set_geometry_for_window(self.geometry())
 
     def closeEvent(self, event):
+        self._terminal_refresh_timer.stop()
         try:
             self.library_view.stop_background_discovery()
         except RuntimeError:
@@ -344,3 +373,21 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
         super().closeEvent(event)
+
+    def return_to_library(self):
+        self.stack.setCurrentIndex(0)
+        self.setWindowTitle("Python Toolbox")
+        self.refresh_drawer()
+        self._terminal_refresh_timer.stop()
+
+    def open_instance_from_drawer(self, item):
+        instance_id = item.data(Qt.ItemDataRole.UserRole)
+        if instance_id:
+            self.show_workspace_for_instance(instance_id)
+            self.drawer.hide()
+
+    def refresh_drawer(self):
+        self.drawer.clear()
+        for instance_id, instance in self.session_manager.instances.items():
+            if instance.status in {"Running", "Starting", "Idle"}:
+                self.drawer.add_running_item(instance_id, f"{instance.tool_name} ({instance.instance_id[:8]})")

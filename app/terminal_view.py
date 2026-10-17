@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QLineEdit, QLabel
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QLineEdit, QLabel, QApplication
 
 
 class TerminalView(QWidget):
@@ -10,6 +10,7 @@ class TerminalView(QWidget):
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.output.setUndoRedoEnabled(False)
 
         self.input_line = QLineEdit()
         self.input_line.setPlaceholderText("Send input to stdin...")
@@ -29,12 +30,45 @@ class TerminalView(QWidget):
         layout.addWidget(self.output, 1)
         layout.addLayout(input_row)
 
-    def append_text(self, text: str) -> None:
+    def _render_stream(self, text: str, *, clear: bool = False) -> None:
+        if clear:
+            self.output.clear()
+        if not text:
+            return
+
         cursor = self.output.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         self.output.setTextCursor(cursor)
-        self.output.insertPlainText(text)
+
+        for ch in text:
+            if ch == "\r":
+                cursor = self.output.textCursor()
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfLine)
+                cursor.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+                self.output.setTextCursor(cursor)
+                self.output.update()
+                self.output.repaint()
+            elif ch == "\n":
+                self.output.insertPlainText("\n")
+                self.output.update()
+                self.output.repaint()
+            else:
+                self.output.insertPlainText(ch)
+                self.output.update()
+                self.output.repaint()
+
         self.output.ensureCursorVisible()
+        self.output.update()
+        self.output.repaint()
+
+    def append_text(self, text: str) -> None:
+        if not text:
+            return
+        self._render_stream(text)
+
+    def render_stream(self, text: str, *, clear: bool = False) -> None:
+        self._render_stream(text, clear=clear)
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
