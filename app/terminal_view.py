@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QLineEdit, QLabel, QApplication
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit, QLineEdit, QLabel
 
 
 class TerminalView(QWidget):
@@ -30,34 +30,10 @@ class TerminalView(QWidget):
         layout.addWidget(self.output, 1)
         layout.addLayout(input_row)
 
-    def _render_stream(self, text: str, *, clear: bool = False) -> None:
-        if clear:
-            self.output.clear()
-        if not text:
-            return
-
-        cursor = self.output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.output.setTextCursor(cursor)
-
-        for ch in text:
-            if ch == "\r":
-                cursor = self.output.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.StartOfLine)
-                cursor.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
-                cursor.removeSelectedText()
-                self.output.setTextCursor(cursor)
-                self.output.update()
-                self.output.repaint()
-            elif ch == "\n":
-                self.output.insertPlainText("\n")
-                self.output.update()
-                self.output.repaint()
-            else:
-                self.output.insertPlainText(ch)
-                self.output.update()
-                self.output.repaint()
-
+    def set_visible_text(self, text: str) -> None:
+        self.output.clear()
+        if text:
+            self.output.insertPlainText(text)
         self.output.ensureCursorVisible()
         self.output.update()
         self.output.repaint()
@@ -65,10 +41,21 @@ class TerminalView(QWidget):
     def append_text(self, text: str) -> None:
         if not text:
             return
-        self._render_stream(text)
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.output.setTextCursor(cursor)
+        self.output.insertPlainText(text)
+        self.output.update()
+        self.output.repaint()
 
     def render_stream(self, text: str, *, clear: bool = False) -> None:
-        self._render_stream(text, clear=clear)
+        if clear:
+            self.output.clear()
+        if text:
+            self.output.insertPlainText(text)
+        self.output.ensureCursorVisible()
+        self.output.update()
+        self.output.repaint()
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)

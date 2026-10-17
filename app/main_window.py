@@ -292,28 +292,21 @@ class MainWindow(QMainWindow):
             instance.output = ""
         self.terminal.output.clear()
 
-    def update_terminal_for_instance(self, instance: ToolInstance):
-        self.terminal.output.clear()
-        if instance.output:
-            self.terminal.output.insertPlainText("".join(instance.output))
-        self.terminal.set_status(instance.status)
-        self.terminal.input_line.setText(instance.input_text)
-
     def refresh_snapshot(self):
-        """Render the current terminal screen state, not a full raw log dump."""
+        """Render the live terminal state only; do not resurrect stale output when switching views."""
         instance = self.session_manager.get_active_instance()
         if instance is None:
             return
 
         text = instance.rendered_output()
-        self.terminal.output.clear()
-        if text:
-            self.terminal.output.insertPlainText(text)
-        self.terminal.output.ensureCursorVisible()
+        self.terminal.set_visible_text(text)
         self.terminal.set_status(instance.status)
 
-    def _refresh_terminal_snapshot(self):
-        self.refresh_snapshot()
+    def update_terminal_for_instance(self, instance: ToolInstance):
+        text = instance.rendered_output()
+        self.terminal.set_visible_text(text)
+        self.terminal.set_status(instance.status)
+        self.terminal.input_line.setText(instance.input_text)
 
     def handle_process_output(self, instance_id: str, text: str):
         instance = self.session_manager.get_instance(instance_id)

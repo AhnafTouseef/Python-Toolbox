@@ -23,41 +23,58 @@ class ToolInstance:
         self.output += text
 
     def rendered_output(self) -> str:
+        """Render the terminal's current visible state, not the raw log history.
+
+        A real terminal treats carriage return as a cursor reset on the current line,
+        not as an instruction to keep appending older text. This implementation
+        models the visible screen buffer so repeated output like `print(i, end="\r")`
+        overwrites the previous value on the same line instead of creating stale log
+        entries.
+        """
         if not self.output:
             return ""
 
-        if "\r" not in self.output and "\b" not in self.output:
+        if "\r" not in self.output and "\n" not in self.output and "\b" not in self.output:
             return self.output
 
-        lines = [""]
-        current_line = 0
-        cursor_col = 0
+        lines: List[str] = [""]
+        row = 0
+        col = 0
+
+        def ensure_row(index: int) -> None:
+            while len(lines) <= index:
+                lines.append("")
+
+        def write_char(ch: str) -> None:
+            nonlocal row, col
+            ensure_row(row)
+            line = lines[row]
+            if col < len(line):
+                line = line[:col] + ch + line[col + 1:]
+            else:
+                line = line + (" " * (col - len(line))) + ch
+            lines[row] = line
+            col += 1
 
         for ch in self.output:
             if ch == "\r":
-                cursor_col = 0
+                col = 0
             elif ch == "\n":
-                current_line += 1
-                if current_line >= len(lines):
-                    lines.append("")
-                cursor_col = 0
+                row += 1
+                ensure_row(row)
+                col = 0
             elif ch == "\b":
-                if cursor_col > 0:
-                    cursor_col -= 1
-                    line = lines[current_line]
-                    if cursor_col < len(line):
-                        lines[current_line] = line[:cursor_col] + line[cursor_col + 1:]
-                    elif line:
-                        lines[current_line] = line[:-1]
+                if col > 0:
+                    col -= 1
+                    line = lines[row]
+                    if col < len(line):
+                        lines[row] = line[:col] + line[col + 1:]
+                    else:
+                        lines[row] = line[:-1]
+            elif ch == "\x1b":
+                continue
             else:
-                while current_line >= len(lines):
-                    lines.append("")
-                line = lines[current_line]
-                if cursor_col <= len(line):
-                    lines[current_line] = line[:cursor_col] + ch + line[cursor_col:]
-                else:
-                    lines[current_line] = line + (" " * (cursor_col - len(line))) + ch
-                cursor_col += 1
+                write_char(ch)
 
         return "\n".join(lines)
 
