@@ -129,7 +129,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-118 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+124 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output
@@ -172,13 +172,15 @@ app/
   terminal_view.py          incremental read-only terminal widget
   active_process_drawer.py  right-side overlay
   gc_guard.py               keeps Python's GC on the GUI thread (see source)
+  error_reporting.py        unexpected-error dialog, always shown from the GUI thread
   theme.py                  dark palette and stylesheet
 ```
 
 ## Status
 
 Developed and tested headless (Qt `offscreen`) on Linux, including every process-handling path
-that exists on both platforms. The Windows-specific code — sending Ctrl+C through a console
-helper and `taskkill /T /F` — follows documented Win32 behaviour but **has not been run on
-Windows**; please exercise Stop on a real Windows machine (a script in `input()`, a
-`time.sleep()` loop, and one that spawns a child process).
+that exists on both platforms. The Windows-only code (Ctrl+C through a console helper,
+`taskkill /T /F`) follows documented Win32 behaviour; a first real Windows run found one bug
+in it (Windows exit codes such as `0xC000013A` exceed a signed 32-bit int), which is now fixed
+and covered by tests that simulate such codes. Please keep exercising Stop on Windows with a
+script in `input()`, a `time.sleep()` loop, and one that spawns a child process.

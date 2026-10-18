@@ -118,11 +118,11 @@ class _Handle:
 class ProcessRunner(QObject):
     output = Signal(str, str)          # kind ("stdout"; "stderr" only when merge_stderr is False), decoded text
     started = Signal(int)              # pid
-    finished = Signal(int, bool)       # exit code, whether the user asked to stop
+    finished = Signal(object, bool)    # exit code (Python int: Windows codes such as 0xC000013A exceed C int), stop requested
     stdinFailed = Signal()             # the process is no longer reading stdin
 
     _wake = Signal(object)
-    _exited = Signal(object, int)
+    _exited = Signal(object, object)    # handle, exit code (Python int, see above)
     _stdin_broke = Signal(object)
 
     interrupt_grace = 3.0              # seconds between interrupt and terminate
@@ -259,30 +259,35 @@ class ProcessRunner(QObject):
                 pass
 
     def _waiter(self, h: _Handle) -> None:
-        code = h.proc.wait()
-        # Wait for the pipes to drain. Readers that are merely waiting for the UI (backpressure) are given
-        # all the time they need; readers stuck in read() because a grandchild inherited the pipe are
-        # abandoned after reader_join_timeout.
-        end = time.monotonic() + self.reader_join_timeout
-        while any(t.is_alive() for t in h.readers):
-            for t in h.readers:
-                t.join(0.02)
-            if time.monotonic() > end:
-                with h.lock:
-                    waiting = h.waiting
-                if waiting == 0:
-                    break
-                end = time.monotonic() + self.reader_join_timeout
-        if not any(t.is_alive() for t in h.readers):
-            for stream in (h.proc.stdout, h.proc.stderr):
-                if stream is None:
-                    continue
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
-        h.stdin_q.put(None)
-        self._exited.emit(h, code)
+        code = -1
+        try:
+            code = h.proc.wait()
+            # Wait for the pipes to drain. Readers that are merely waiting for the UI (backpressure) are given
+            # all the time they need; readers stuck in read() because a grandchild inherited the pipe are
+            # abandoned after reader_join_timeout.
+            end = time.monotonic() + self.reader_join_timeout
+            while any(t.is_alive() for t in h.readers):
+                for t in h.readers:
+                    t.join(0.02)
+                if time.monotonic() > end:
+                    with h.lock:
+                        waiting = h.waiting
+                    if waiting == 0:
+                        break
+                    end = time.monotonic() + self.reader_join_timeout
+            if not any(t.is_alive() for t in h.readers):
+                for stream in (h.proc.stdout, h.proc.stderr):
+                    if stream is None:
+                        continue
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+        except Exception:
+            log.exception("Error while waiting for process %s", h.proc.pid)
+        finally:
+            h.stdin_q.put(None)
+            self._exited.emit(h, code)          # without this the instance would stay "running" forever
 
     # ------------------------------------------------------------------ GUI-thread delivery
     def _on_wake(self, h: _Handle) -> None:
