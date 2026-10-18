@@ -1,1 +1,2 @@
-PySide6>=6.7.0
+# Application dependencies only. Individual tools keep their own requirements / .venv.
+PySide6>=6.6,<7

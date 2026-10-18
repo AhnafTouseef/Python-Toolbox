@@ -1,144 +1,237 @@
+"""Tool metadata (tool.json): generation, validation, repair and safe saving.
+
+Pure Python, no Qt, so it can be tested without a display.
+
+tool.json holds exactly four application-managed attributes (name, description,
+icon, color).  Unknown extra fields are preserved untouched.  Valid
+user-customised values are never overwritten; only missing/invalid fields are
+repaired.
+"""
+
 from __future__ import annotations
 
+import colorsys
 import json
+import logging
+import os
 import random
 import re
+import shutil
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Callable
 
-from app.icon_manager import IconManager
+log = logging.getLogger(__name__)
 
-
-REQUIRED_FIELDS = {"name", "description", "icon", "color"}
-HEX_COLOR_RE = re.compile(r"^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$")
-
-
-def prettify_folder_name(folder_name: str) -> str:
-    name = folder_name.replace("_", " ").replace("-", " ")
-    words = re.sub(r"(?<!^)(?=[A-Z])", " ", name).split()
-    return " ".join(word.capitalize() for word in words if word)
+HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+MANAGED_KEYS = ("name", "description", "icon", "color")
+METADATA_FILENAME = "tool.json"
 
 
-def generate_random_color() -> str:
-    while True:
-        hue = random.randint(0, 359)
-        sat = random.randint(45, 95)
-        val = random.randint(45, 85)
-        r, g, b = __hsv_to_rgb(hue, sat / 100, val / 100)
-        if (r, g, b) == (255, 255, 255):
-            continue
-        if max(r, g, b) < 180 and min(r, g, b) > 130:
-            continue
-        if abs(r - g) < 8 and abs(g - b) < 8 and abs(r - b) < 8:
-            continue
-        return f"#{r:02X}{g:02X}{b:02X}"
+@dataclass
+class ToolMetadata:
+    name: str
+    description: str
+    icon: str
+    color: str
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "description": self.description, "icon": self.icon, "color": self.color}
 
 
-def __hsv_to_rgb(h: int, s: float, v: float) -> Tuple[int, int, int]:
-    c = v * s
-    x = c * (1 - abs((h / 60) % 2 - 1))
-    m = v - c
-
-    if 0 <= h < 60:
-        r, g, b = c, x, 0
-    elif 60 <= h < 120:
-        r, g, b = x, c, 0
-    elif 120 <= h < 180:
-        r, g, b = 0, c, x
-    elif 180 <= h < 240:
-        r, g, b = 0, x, c
-    elif 240 <= h < 300:
-        r, g, b = x, 0, c
-    else:
-        r, g, b = c, 0, x
-    return tuple(int((channel + m) * 255) for channel in (r, g, b))
+@dataclass
+class LoadResult:
+    metadata: ToolMetadata
+    extras: dict = field(default_factory=dict)
+    issues: list[str] = field(default_factory=list)   # user-facing notices (warnings/errors)
 
 
-def get_icon_names() -> Iterable[str]:
-    return IconManager().names
+# --- helpers ------------------------------------------------------------------
+def prettify_name(dirname: str) -> str:
+    """`VideoProcessor` -> `Video Processor`, `data_analyzer` -> `Data Analyzer`, `PDFTool` -> `PDF Tool`."""
+    s = re.sub(r"[_\-.]+", " ", dirname)
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s)          # fooBar -> foo Bar
+    s = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", s)        # PDFTool -> PDF Tool
+    words = [w[0].upper() + w[1:] if w.islower() else w for w in s.split()]
+    return " ".join(words) or dirname
 
 
-def valid_hex_color(value: Any) -> bool:
-    return isinstance(value, str) and bool(HEX_COLOR_RE.match(value))
+def is_valid_hex(value: object) -> bool:
+    return isinstance(value, str) and HEX_RE.match(value) is not None
 
 
-def valid_icon_name(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    return value in set(get_icon_names())
+def normalize_hex(value: str) -> str:
+    return value.upper()
 
 
-def validate_tool_metadata(metadata: Dict[str, Any], tool_dir: Path) -> Dict[str, Any]:
-    safe = {"name": prettify_folder_name(tool_dir.name), "description": "", "icon": "wrench", "color": generate_random_color()}
-    if isinstance(metadata, dict):
-        for key, value in metadata.items():
-            if key not in REQUIRED_FIELDS:
-                continue
-            if key == "name":
-                if isinstance(value, str) and value.strip():
-                    safe["name"] = value.strip()
-                else:
-                    safe["name"] = prettify_folder_name(tool_dir.name)
-            elif key == "description":
-                safe["description"] = value if isinstance(value, str) else ""
-            elif key == "icon":
-                safe["icon"] = value if valid_icon_name(value) else "wrench"
-            elif key == "color":
-                safe["color"] = value if valid_hex_color(value) else generate_random_color()
-    return safe
+def chroma(hex_color: str) -> float:
+    """max(r,g,b) - min(r,g,b) in 0..1; ~0 for white/grey/black."""
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return max(r, g, b) - min(r, g, b)
 
 
-def ensure_metadata(tool_dir: Path) -> Dict[str, Any]:
-    metadata_path = tool_dir / "tool.json"
-    if not metadata_path.exists():
-        defaults = {
-            "name": prettify_folder_name(tool_dir.name),
-            "description": "",
-            "icon": "wrench",
-            "color": generate_random_color(),
-        }
-        write_metadata(metadata_path, defaults)
-        return defaults
+def is_near_neutral(hex_color: str, min_chroma: float = 0.2) -> bool:
+    return chroma(hex_color) < min_chroma
+
+
+def random_accent_color(rng: random.Random | None = None) -> str:
+    """Random, clearly coloured, bright-enough accent. Never white/grey/near-neutral."""
+    rng = rng or random
+    h = rng.random()
+    s = rng.uniform(0.50, 0.85)
+    v = rng.uniform(0.78, 0.98)
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return "#{:02X}{:02X}{:02X}".format(round(r * 255), round(g * 255), round(b * 255))
+
+
+def default_metadata(dirname: str, generic_icon: str, rng: random.Random | None = None) -> ToolMetadata:
+    return ToolMetadata(name=prettify_name(dirname), description="", icon=generic_icon,
+                        color=random_accent_color(rng))
+
+
+def validate_fields(name: object, description: object, icon: object, color: object,
+                    icon_exists: Callable[[object], bool]) -> list[str]:
+    """Human-readable problems with a set of field values (empty list == valid)."""
+    problems: list[str] = []
+    if not isinstance(name, str) or not name.strip():
+        problems.append("Name must not be empty.")
+    if not isinstance(description, str):
+        problems.append("Description must be text.")
+    if not icon_exists(icon):
+        problems.append(f"Icon {icon!r} is not in the bundled icon library.")
+    if not is_valid_hex(color):
+        problems.append(f"Color {color!r} is not a valid hex color (expected #RRGGBB, e.g. #A78BFA).")
+    return problems
+
+
+def _dump(data: dict) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write via a temp file + replace. Raises OSError on failure (caller reports it)."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_dump(data))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+# --- load / repair ------------------------------------------------------------
+def load_or_create(tool_dir: Path, icon_exists: Callable[[object], bool], generic_icon: str,
+                   rng: random.Random | None = None) -> LoadResult:
+    path = tool_dir / METADATA_FILENAME
+    dirname = tool_dir.name
+    issues: list[str] = []
+
+    if not path.exists():
+        meta = default_metadata(dirname, generic_icon, rng)
+        try:
+            atomic_write_json(path, meta.to_dict())
+        except OSError as exc:
+            issues.append(f"{dirname}: could not save a new tool.json ({exc}). "
+                          f"Defaults are used for this session only and were NOT saved.")
+        return LoadResult(meta, {}, issues)
+
+    # Read + parse -----------------------------------------------------------
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Unreadable is not the same as malformed: never overwrite what we could not read.
+        issues.append(f"{dirname}: tool.json could not be read ({exc}). "
+                      f"Defaults are used for this session; the file was left untouched.")
+        return LoadResult(default_metadata(dirname, generic_icon, rng), {}, issues)
+    except UnicodeDecodeError as exc:
+        return _regenerate_malformed(tool_dir, path, generic_icon, rng, f"not valid UTF-8 text ({exc})")
 
     try:
-        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        backup_path = metadata_path.with_suffix(".json.bak")
+        data = json.loads(raw)
+    except ValueError as exc:
+        return _regenerate_malformed(tool_dir, path, generic_icon, rng, f"malformed JSON ({exc})")
+    if not isinstance(data, dict):
+        return _regenerate_malformed(tool_dir, path, generic_icon, rng,
+                                     f"expected a JSON object, found {type(data).__name__}")
+
+    # Validate field by field; repair only what is missing/invalid -------------
+    defaults = default_metadata(dirname, generic_icon, rng)
+    repaired = dict(data)
+    changed = False
+
+    def check(key: str, ok: bool, fallback: str) -> str:
+        nonlocal changed
+        if key not in data:
+            log.info("%s: tool.json is missing %r; adding it", dirname, key)
+            repaired[key] = fallback
+            changed = True
+            return fallback
+        if not ok:
+            issues.append(f"{dirname}: tool.json field '{key}' has an invalid value ({data[key]!r}); "
+                          f"replaced with {fallback!r}.")
+            repaired[key] = fallback
+            changed = True
+            return fallback
+        return data[key]
+
+    name = check("name", isinstance(data.get("name"), str) and bool(data["name"].strip()), defaults.name)
+    desc = check("description", isinstance(data.get("description"), str), defaults.description)
+    icon = check("icon", icon_exists(data.get("icon")), defaults.icon)
+    color = check("color", is_valid_hex(data.get("color")), defaults.color)
+
+    if changed:
         try:
-            if metadata_path.exists():
-                backup_path.write_bytes(metadata_path.read_bytes())
-        except OSError:
-            backup_path = None
-        defaults = {
-            "name": prettify_folder_name(tool_dir.name),
-            "description": "",
-            "icon": "wrench",
-            "color": generate_random_color(),
-        }
-        write_metadata(metadata_path, defaults)
-        return defaults
+            atomic_write_json(path, repaired)
+        except OSError as exc:
+            issues.append(f"{dirname}: repaired tool.json could not be saved ({exc}). "
+                          f"The repair applies for this session only.")
 
-    valid = validate_tool_metadata(raw, tool_dir)
-    if valid != raw:
-        write_metadata(metadata_path, valid)
-    return valid
+    extras = {k: v for k, v in data.items() if k not in MANAGED_KEYS}
+    return LoadResult(ToolMetadata(name, desc, icon, color), extras, issues)
 
 
-def write_metadata(path: Path, metadata: Dict[str, Any]) -> None:
-    if not path.parent.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"name": metadata.get("name", prettify_folder_name(path.parent.name)),
-               "description": metadata.get("description", ""),
-               "icon": metadata.get("icon", "wrench"),
-               "color": metadata.get("color", generate_random_color())}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+def _regenerate_malformed(tool_dir: Path, path: Path, generic_icon: str,
+                          rng: random.Random | None, reason: str) -> LoadResult:
+    dirname = tool_dir.name
+    meta = default_metadata(dirname, generic_icon, rng)
+    backup = path.with_name(f"{path.name}.malformed-{time.strftime('%Y%m%d-%H%M%S')}.bak")
+    n = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.malformed-{time.strftime('%Y%m%d-%H%M%S')}-{n}.bak")
+        n += 1
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        # Cannot preserve the user's file -> do not destroy it.
+        return LoadResult(meta, {}, [
+            f"{dirname}: tool.json is unusable ({reason}) and no backup could be made ({exc}). "
+            f"The file was left untouched; defaults are used for this session."])
+    issues = [f"{dirname}: tool.json is unusable ({reason}). A backup was saved as {backup.name} "
+              f"and default metadata was generated."]
+    try:
+        atomic_write_json(path, meta.to_dict())
+    except OSError as exc:
+        issues.append(f"{dirname}: default tool.json could not be written ({exc}); defaults apply for this session only.")
+    return LoadResult(meta, {}, issues)
 
 
-def discover_tools(tools_dir: Path) -> list[Path]:
-    if not tools_dir.exists():
-        return []
-    discovered = []
-    for child in sorted(tools_dir.iterdir()):
-        if child.is_dir() and (child / "main.py").exists():
-            discovered.append(child)
-    return discovered
+def save_metadata(tool_dir: Path, meta: ToolMetadata) -> None:
+    """Persist edited metadata, keeping unknown fields from the current file. Raises OSError."""
+    path = tool_dir / METADATA_FILENAME
+    merged: dict = {}
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(current, dict):
+            merged = {k: v for k, v in current.items() if k not in MANAGED_KEYS}
+    except (OSError, ValueError):
+        pass
+    data = meta.to_dict()
+    data.update(merged)
+    atomic_write_json(path, data)

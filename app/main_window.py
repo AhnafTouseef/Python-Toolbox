@@ -1,386 +1,172 @@
+"""Main window: library <-> workspace pages with the active-process drawer layered on top."""
+
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import logging
 
-if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QMainWindow, QMessageBox, QStackedWidget, QWidget
 
-import json
-from pathlib import Path
+from . import theme
+from .active_process_drawer import ActiveProcessDrawer
+from .config import AppConfig
+from .icon_manager import IconManager
+from .library_view import LibraryView
+from .session_manager import Session, SessionManager
+from .tool_registry import ToolRegistry
+from .tool_settings import ToolSettingsDialog
+from .workspace_view import WorkspaceView
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QFont
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QStackedLayout, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTabBar, QMessageBox, QToolButton
+log = logging.getLogger(__name__)
 
-from app.active_process_drawer import ActiveProcessDrawer
-from app.library_view import ToolLibraryView
-from app.process_manager import ProcessManager
-from app.session_manager import SessionManager, ToolInstance
-from app.terminal_view import TerminalView
-from app.theme import AppTheme
-from app.tool_metadata import discover_tools, ensure_metadata, write_metadata
+
+class Stage(QWidget):
+    """Holds the pages and the drawer layer; keeps the layer exactly on top of the pages."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.pages = QStackedWidget(self)
+        self.drawer: ActiveProcessDrawer | None = None
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        rect = QRect(0, 0, self.width(), self.height())
+        self.pages.setGeometry(rect)                 # pages get the full size; the drawer overlays them
+        if self.drawer is not None:
+            self.drawer.fit_to(rect)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, registry: ToolRegistry, icons: IconManager, config: AppConfig, manager: SessionManager):
         super().__init__()
         self.setWindowTitle("Python Toolbox")
-        self.resize(1200, 760)
-        self.setStyleSheet(AppTheme.stylesheet())
+        self.registry, self.icons, self.config, self.manager = registry, icons, config, manager
+        self.resize(1100, 720)
+        self.setMinimumSize(520, 420)
 
-        self.tools_dir = Path(__file__).resolve().parent.parent / "tools"
-        self.global_python = "C:/Users/lenovo/AppData/Local/Programs/Python/Python312/python.exe"
-        self.registry = {}
-        self.session_manager = SessionManager()
-        self.process_manager = ProcessManager()
+        self.stage = Stage()
+        self.setCentralWidget(self.stage)
+        self.library = LibraryView(registry, icons, manager.tool_status)
+        self.workspace = WorkspaceView(manager, registry, icons)
+        self.stage.pages.addWidget(self.library)
+        self.stage.pages.addWidget(self.workspace)
+        self.drawer = ActiveProcessDrawer(manager, icons, self.stage)
+        self.stage.drawer = self.drawer
 
-        self.central = QWidget()
-        self.stack = QStackedLayout(self.central)
-        self.setCentralWidget(self.central)
+        self.library.openRequested.connect(self.open_tool)
+        self.library.settingsRequested.connect(self.open_settings)
+        self.library.activeRequested.connect(self.drawer.open_drawer)
+        self.workspace.backRequested.connect(self.show_library)
+        self.workspace.newInstanceRequested.connect(self.new_instance)
+        self.workspace.closeRequested.connect(self.close_session)
+        self.drawer.sessionSelected.connect(self.show_session)
+        manager.sessionChanged.connect(self._on_session_changed)
+        manager.sessionRemoved.connect(lambda s: self._after_session_event(s.tool_id))
+        manager.sessionAdded.connect(lambda s: self._after_session_event(s.tool_id))
 
-        self.library_view = ToolLibraryView()
-        self.library_view.setParent(self)
-        self.library_view.session_manager = self.session_manager
-        self.library_view.setObjectName("library")
-        self.library_view.launch_requested.connect(self.open_tool_by_path)
-        self.library_view.settings_requested.connect(self.open_settings_for_path)
+        self.stage.pages.setCurrentWidget(self.library)
+        self.drawer.fit_to(QRect(0, 0, self.stage.width(), self.stage.height()))
+        if registry.issues:
+            log.warning("Tool notices:\n%s", "\n".join(registry.issues))
+        if config.notice:
+            log.warning(config.notice)
 
-        self.workspace = QWidget()
-        self.workspace_layout = QVBoxLayout(self.workspace)
-        self.workspace_layout.setContentsMargins(12, 12, 12, 12)
+    # ------------------------------------------------------------------ navigation
+    def show_library(self) -> None:
+        self.stage.pages.setCurrentWidget(self.library)
 
-        self.top_bar = QWidget(); self.top_bar_layout = QHBoxLayout(self.top_bar)
-        self.back_button = QPushButton("Back")
-        self.back_button.clicked.connect(self.return_to_library)
-        self.tab_bar = QTabBar()
-        self.tab_bar.setExpanding(False)
-        self.tab_bar.setAutoHide(False)
-        self.tab_bar.setTabsClosable(True)
-        self.tab_bar.tabCloseRequested.connect(self.close_instance_tab)
-        self.tab_bar.tabBarClicked.connect(self.on_tab_selected)
-        self.tab_bar.tabBarDoubleClicked.connect(self.on_tab_double_click)
-        self._tab_instance_map = {}
-        self._refreshing_tabs = False
-        self.new_instance_button = QPushButton("+")
-        self.new_instance_button.clicked.connect(self.create_new_instance)
+    def show_workspace(self) -> None:
+        self.stage.pages.setCurrentWidget(self.workspace)
+        s = self.workspace.current_session()
+        pane = self.workspace.pane(s) if s else None
+        if pane is not None:
+            (pane.input if pane.input.isEnabled() else self.workspace.run_button).setFocus()
 
-        self.top_bar_layout.addWidget(self.back_button)
-        self.top_bar_layout.addWidget(self.tab_bar, 1)
-        self.top_bar_layout.addWidget(self.new_instance_button)
-
-        self.run_button = QPushButton("Run")
-        self.stop_button = QPushButton("Stop")
-        self.clear_button = QPushButton("Clear")
-        self.run_button.clicked.connect(self.run_active_instance)
-        self.stop_button.clicked.connect(self.stop_active_instance)
-        self.clear_button.clicked.connect(self.clear_output)
-
-        self.controls = QWidget(); self.controls_layout = QHBoxLayout(self.controls)
-        self.controls_layout.addWidget(self.run_button)
-        self.controls_layout.addWidget(self.stop_button)
-        self.controls_layout.addWidget(self.clear_button)
-
-        self.terminal = TerminalView()
-        self.terminal.input_line.returnPressed.connect(self.send_input)
-
-        self.process_manager.output_received.connect(self.handle_process_output)
-        self.process_manager.status_changed.connect(self.handle_process_status)
-
-        self.workspace_layout.addWidget(self.top_bar)
-        self.workspace_layout.addWidget(self.controls)
-        self.workspace_layout.addWidget(self.terminal)
-
-        self.drawer = ActiveProcessDrawer(self)
-        self.drawer.list_widget.itemActivated.connect(self.open_instance_from_drawer)
-        self.drawer.hide()
-
-        self.stack.addWidget(self.library_view)
-        self.stack.addWidget(self.workspace)
-        self.stack.setCurrentIndex(0)
-
-        self._library_load_timer = QTimer(self)
-        self._library_load_timer.setSingleShot(True)
-        self._library_load_timer.timeout.connect(self.load_library_tools)
-
-        self.bind_drawer_button()
-
-        self._terminal_refresh_timer = QTimer(self)
-        self._terminal_refresh_timer.setInterval(5000)
-        self._terminal_refresh_timer.timeout.connect(self.refresh_snapshot)
-
-        self.tab_bar.setStyleSheet("QTabBar::tab { background: #1F2937; border: 1px solid #2D3748; border-bottom: none; border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 8px 12px; color: #E5E7EB; } QTabBar::tab:selected { background: #1B2230; border-color: #3B82F6; } QTabBar::close-button { image: none; margin: 4px; }")
-        tab_font = QFont()
-        tab_font.setPointSize(10)
-        self.tab_bar.setFont(tab_font)
-
-        self.active_process_button = QToolButton(self)
-        self.active_process_button.setToolTip("Active processes")
-        self.active_process_button.setText("◉")
-        self.active_process_button.setFixedSize(32, 32)
-        button_font = QFont()
-        button_font.setPointSize(16)
-        self.active_process_button.setFont(button_font)
-        self.active_process_button.setStyleSheet(
-            "QToolButton { border: 1px solid #334155; border-radius: 8px; background: #111827; color: #e2e8f0; } "
-            "QToolButton:hover { background: #1f2937; border-color: #475569; } "
-            "QToolButton:pressed { background: #0f172a; }"
-        )
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._library_load_timer.isActive():
-            self._library_load_timer.start(0)
-
-    def bind_drawer_button(self):
-        self.active_process_button = QToolButton(self)
-        self.active_process_button.setToolTip("Active processes")
-        self.active_process_button.setText("◉")
-        self.active_process_button.setFixedSize(32, 32)
-        self.active_process_button.setStyleSheet(
-            "QToolButton { border: 1px solid #334155; border-radius: 8px; background: #111827; color: #e2e8f0; } "
-            "QToolButton:hover { background: #1f2937; border-color: #475569; } "
-            "QToolButton:pressed { background: #0f172a; }"
-        )
-        self.active_process_button.clicked.connect(self.toggle_drawer)
-        self.menuBar().setCornerWidget(self.active_process_button, Qt.TopRightCorner)
-
-    def toggle_drawer(self):
-        if self.drawer.isVisible():
-            self.drawer.hide()
-        else:
-            self.drawer.set_geometry_for_window(self.geometry())
-            self.drawer.show_drawer()
-
-    def load_library_tools(self):
-        self.library_view.start_background_discovery(self.tools_dir)
-        self.refresh_drawer()
-
-    def open_tool_by_path(self, path: str):
-        tool_dir = Path(path)
-        metadata = self.registry.get(path) or ensure_metadata(tool_dir)
-        for instance in self.session_manager.instances.values():
-            if instance.tool_dir == tool_dir:
-                self.session_manager.set_active_instance(instance.instance_id)
-                self.show_workspace_for_instance(instance.instance_id)
+    def open_tool(self, tool_id: str) -> None:
+        """Library card clicked: go to the tool's most recently active instance, or open a first one."""
+        s = self.manager.most_recent(tool_id)
+        if s is None:
+            try:
+                s = self.manager.create(tool_id)
+            except KeyError:
+                QMessageBox.warning(self, "Tool not found", "This tool is no longer available.")
                 return
-        interpreter = self.resolve_interpreter(tool_dir)
-        instance = self.session_manager.create_instance(metadata["name"], tool_dir, interpreter)
-        self.show_workspace_for_instance(instance.instance_id)
-        self.refresh_tabs()
+        self.workspace.select_session(s)
+        self.show_workspace()
 
-    def open_settings_for_path(self, path: str):
-        tool_dir = Path(path)
-        metadata = ensure_metadata(tool_dir)
-        from app.tool_settings import ToolSettingsDialog
-        dialog = ToolSettingsDialog(tool_dir, metadata)
-        if dialog.exec() == 1:
-            data = dialog.metadata
-            write_metadata(tool_dir / "tool.json", data)
-            self.registry[str(tool_dir)] = data
-            self.library_view.refresh_tool_card(tool_dir, data)
-            self.load_library_tools()
+    def show_session(self, session: Session) -> None:
+        """Jump to one exact instance (used by the active-process drawer)."""
+        self.workspace.select_session(session)
+        self.show_workspace()
 
-    def resolve_interpreter(self, tool_dir: Path) -> str:
-        venv_python = tool_dir / ".venv" / "Scripts" / "python.exe"
-        if venv_python.exists():
-            return str(venv_python)
-        if (tool_dir / ".venv").exists():
-            raise FileNotFoundError(f"Missing interpreter at {venv_python}. Please repair the tool environment.")
-        return self.global_python
-
-    def show_workspace_for_instance(self, instance_id: str):
-        self.session_manager.set_active_instance(instance_id)
-        instance = self.session_manager.get_active_instance()
-        if not instance:
+    def new_instance(self) -> None:
+        current = self.workspace.current_session()
+        if current is None:
             return
-        self.setWindowTitle(f"Python Toolbox - {instance.tool_name}")
-        self.stack.setCurrentIndex(1)
-        self.update_terminal_for_instance(instance)
-        self._terminal_refresh_timer.start()
-        if not self._refreshing_tabs:
-            self.refresh_tabs()
+        s = self.manager.create(current.tool_id)
+        self.workspace.select_session(s)
+        self.show_workspace()
 
-    def refresh_tabs(self):
-        self._refreshing_tabs = True
-        self._tab_instance_map = {}
-        while self.tab_bar.count() > 0:
-            self.tab_bar.removeTab(0)
-        for instance_id in self.session_manager.tabs:
-            instance = self.session_manager.get_instance(instance_id)
-            if not instance:
-                continue
-            self.tab_bar.addTab(instance.tool_name)
-            self._tab_instance_map[self.tab_bar.count() - 1] = instance_id
-            close_button = QToolButton()
-            close_button.setText("×")
-            close_button.setToolTip("Close tab")
-            close_button.setStyleSheet("QToolButton { border: none; background: transparent; color: #cbd5e1; padding: 0 4px; font-size: 14px; } QToolButton:hover { color: #ffffff; }")
-            close_button.clicked.connect(lambda checked=False, tab_id=instance_id: self.close_instance_by_id(tab_id))
-            self.tab_bar.setTabButton(self.tab_bar.count() - 1, self.tab_bar.ButtonPosition.RightSide, close_button)
-            if instance_id == self.session_manager.active_instance_id:
-                self.tab_bar.setCurrentIndex(self.tab_bar.count() - 1)
-        self._refreshing_tabs = False
+    # ------------------------------------------------------------------ closing instances
+    def confirm_stop_and_close(self, session: Session) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Close running instance?")
+        box.setText(f"“{self.manager.label(session)}” is still running.")
+        box.setInformativeText("Closing the tab stops the process and discards its output.")
+        stop = box.addButton("Stop and close", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(box.buttons()[1])
+        box.exec()
+        return box.clickedButton() is stop
 
-    def on_tab_selected(self, index):
-        if self._refreshing_tabs or index < 0 or index not in self._tab_instance_map:
+    def close_session(self, session: Session) -> None:
+        if session.is_running and not self.confirm_stop_and_close(session):
             return
-        instance_id = self._tab_instance_map[index]
-        if instance_id != self.session_manager.active_instance_id:
-            self.show_workspace_for_instance(instance_id)
+        self.manager.remove(session)                 # destroys output/state; stops a live process
+        if not self.manager.sessions:
+            self.show_library()                      # last tab closed -> back to the library
+        else:
+            self.workspace.refresh_all()
 
-    def on_tab_double_click(self, index):
-        instance_id = self._tab_instance_map.get(index)
-        if instance_id:
-            self.close_instance_by_id(instance_id)
-
-    def close_instance_by_id(self, instance_id: str):
-        if instance_id in self.session_manager.instances:
-            self.session_manager.close_instance(instance_id)
-            self.refresh_tabs()
-            if not self.session_manager.tabs:
-                self.return_to_library()
-            else:
-                self.show_workspace_for_instance(self.session_manager.tabs[-1])
-
-    def close_instance_tab(self, index):
-        instance_id = self._tab_instance_map.get(index)
-        if instance_id:
-            self.close_instance_by_id(instance_id)
-
-    def run_active_instance(self):
-        instance = self.session_manager.get_active_instance()
-        if not instance:
+    # ------------------------------------------------------------------ settings
+    def open_settings(self, tool_id: str) -> None:
+        tool = self.registry.get(tool_id)
+        if tool is None:
             return
-        main_script = instance.tool_dir / "main.py"
-        if not main_script.exists():
-            self.terminal.set_status("Main script missing")
-            QMessageBox.warning(self, "Tool launch failed", f"{instance.tool_name} is missing main.py in its directory.")
-            return
+        dlg = ToolSettingsDialog(tool, self.registry, self.icons, self)
         try:
-            result = self.process_manager.start_process(instance, main_script, instance.interpreter)
-            if result == "started":
-                self.terminal.set_status("Running")
-                self.update_terminal_for_instance(instance)
-                self.refresh_drawer()
-        except Exception as exc:
-            self.terminal.set_status("Launch failed")
-            QMessageBox.warning(self, "Tool launch failed", str(exc))
+            dlg.exec()
+        finally:
+            dlg.deleteLater()
 
-    def stop_active_instance(self):
-        instance = self.session_manager.get_active_instance()
-        if not instance:
+    # ------------------------------------------------------------------ status plumbing
+    def _on_session_changed(self, session: Session) -> None:
+        self._after_session_event(session.tool_id)
+
+    def _after_session_event(self, tool_id: str) -> None:
+        self.library.refresh_status(tool_id)
+        self.library.set_active_count(len(self.manager.running()))
+
+    # ------------------------------------------------------------------ quitting
+    def confirm_quit(self, n: int) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Quit Python Toolbox?")
+        box.setText(f"{n} process{'es are' if n != 1 else ' is'} still running.")
+        box.setInformativeText("Quitting stops them.")
+        quit_btn = box.addButton("Stop all and quit", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(box.buttons()[1])
+        box.exec()
+        return box.clickedButton() is quit_btn
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        running = self.manager.running()
+        if running and not self.confirm_quit(len(running)):
+            event.ignore()
             return
-        self.process_manager.stop_process(instance)
-        self.update_terminal_for_instance(instance)
-        self.refresh_drawer()
-
-    def send_input(self):
-        instance = self.session_manager.get_active_instance()
-        if not instance:
-            return
-        text = self.terminal.input_line.text()
-        if not text:
-            return
-        self.process_manager.write_stdin(instance, text)
-        instance.input_text = text
-        self.terminal.input_line.clear()
-
-    def clear_output(self):
-        instance = self.session_manager.get_active_instance()
-        if instance is not None:
-            instance.output = ""
-        self.terminal.output.clear()
-
-    def refresh_snapshot(self):
-        """Render the live terminal state only; do not resurrect stale output when switching views."""
-        instance = self.session_manager.get_active_instance()
-        if instance is None:
-            return
-
-        text = instance.rendered_output()
-        self.terminal.set_visible_text(text)
-        self.terminal.set_status(instance.status)
-
-    def update_terminal_for_instance(self, instance: ToolInstance):
-        text = instance.rendered_output()
-        self.terminal.set_visible_text(text)
-        self.terminal.set_status(instance.status)
-        self.terminal.input_line.setText(instance.input_text)
-
-    def handle_process_output(self, instance_id: str, text: str):
-        instance = self.session_manager.get_instance(instance_id)
-        if not instance:
-            return
-        instance.append_output(text)
-        if self.session_manager.active_instance_id == instance_id:
-            self.refresh_snapshot()
-            self.terminal.set_status(instance.status)
-
-    def handle_process_status(self, instance_id: str, status: str):
-        instance = self.session_manager.get_instance(instance_id)
-        if not instance:
-            return
-        instance.status = status
-        if self.session_manager.active_instance_id == instance_id:
-            self.terminal.set_status(status)
-        self.refresh_drawer()
-        for key, card in self.library_view.card_map.items():
-            if str(Path(card.tool_dir)) == str(instance.tool_dir):
-                card.set_status_from_state(status)
-                break
-
-    def create_new_instance(self):
-        """Create another tab for the currently active tool, or fall back to the library when nothing is open."""
-        active = self.session_manager.get_active_instance()
-        if not active:
-            self.return_to_library()
-            return
-
-        new_instance = self.session_manager.create_instance(
-            active.tool_name,
-            active.tool_dir,
-            active.interpreter,
-        )
-        self.show_workspace_for_instance(new_instance.instance_id)
-        self.refresh_tabs()
-        self.refresh_drawer()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if self.drawer.isVisible():
-            self.drawer.set_geometry_for_window(self.geometry())
-
-    def closeEvent(self, event):
-        self._terminal_refresh_timer.stop()
-        try:
-            self.library_view.stop_background_discovery()
-        except RuntimeError:
-            pass
-
-        if self.process_manager is not None:
-            for proc in list(self.process_manager.running.values()):
-                try:
-                    proc.kill()
-                    proc.waitForFinished(500)
-                except RuntimeError:
-                    pass
-        super().closeEvent(event)
-
-    def return_to_library(self):
-        self.stack.setCurrentIndex(0)
-        self.setWindowTitle("Python Toolbox")
-        self.refresh_drawer()
-        self._terminal_refresh_timer.stop()
-
-    def open_instance_from_drawer(self, item):
-        instance_id = item.data(Qt.ItemDataRole.UserRole)
-        if instance_id:
-            self.show_workspace_for_instance(instance_id)
-            self.drawer.hide()
-
-    def refresh_drawer(self):
-        self.drawer.clear()
-        for instance_id, instance in self.session_manager.instances.items():
-            if instance.status in {"Running", "Starting", "Idle"}:
-                self.drawer.add_running_item(instance_id, f"{instance.tool_name} ({instance.instance_id[:8]})")
+        self.manager.shutdown()
+        event.accept()
