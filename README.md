@@ -84,7 +84,9 @@ terminal, a stdin field and Clear.
   (it is **not** started automatically — press Run). `+` adds another instance of the
   current tool.
 * **Back** and switching tabs never stop anything. **Closing a tab** destroys the instance;
-  if it is running you are asked first. Closing the last tab returns to the library.
+  if it is running, the tab's ✕ asks first, while **double-clicking the tab** stops the process and
+  closes it without asking (the quick way). Closing the last
+  tab returns to the library.
 * **Run** starts a fresh process and appends below the previous output with a dated
   separator. **Stop** sends Ctrl+C and, if the script has not exited after ~3 s, terminates it,
   then (~2 s later) kills the whole process tree. While stopping, the button becomes **Force

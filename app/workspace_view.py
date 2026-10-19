@@ -75,7 +75,8 @@ class SessionPane(QWidget):
 class WorkspaceView(QWidget):
     backRequested = Signal()
     newInstanceRequested = Signal()
-    closeRequested = Signal(object)        # Session: the user clicked a tab's close button
+    closeRequested = Signal(object)        # Session: the user clicked a tab's close button (asks if running)
+    quickCloseRequested = Signal(object)   # Session: the user double-clicked a tab (stops and closes, no question)
     currentChanged = Signal(object)        # Session or None
 
     def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager,
@@ -160,6 +161,7 @@ class WorkspaceView(QWidget):
         self.plus_button.clicked.connect(self.newInstanceRequested)
         self.run_button.clicked.connect(self._run_or_stop)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabBarDoubleClicked.connect(self._tab_double_clicked)
         manager.sessionAdded.connect(self.add_session)
         manager.sessionRemoved.connect(self.remove_session)
         manager.sessionChanged.connect(self._on_session_changed)
@@ -191,7 +193,7 @@ class WorkspaceView(QWidget):
         close.setIcon(self._icons.icon("x", theme.TEXT_MUTED, 14))
         close.setIconSize(QSize(14, 14))
         close.setFixedSize(20, 20)
-        close.setToolTip("Close this instance (discards its output)")
+        close.setToolTip("Close this instance (asks first if it is running). Double-click the tab to close it without asking.")
         close.setAccessibleName("Close instance")
         close.clicked.connect(lambda _=False, sid=session.id: self._close_clicked(sid))
         self.tabs.setTabButton(idx, QTabBar.ButtonPosition.RightSide, close)
@@ -213,6 +215,15 @@ class WorkspaceView(QWidget):
         if idx >= 0:
             self.tabs.setCurrentIndex(idx)
             self._on_tab_changed(idx)
+
+    def _tab_double_clicked(self, index: int) -> None:
+        """Double-click = quick close: stops a running process and closes the tab without asking.
+        (The tab's close button is the careful way: it asks first.) index is -1 on empty bar space."""
+        if index < 0:
+            return
+        s = self._manager.get(self.tabs.tabData(index))
+        if s is not None:
+            self.quickCloseRequested.emit(s)
 
     def _close_clicked(self, session_id: str) -> None:
         s = self._manager.get(session_id)

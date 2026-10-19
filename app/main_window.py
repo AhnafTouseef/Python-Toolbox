@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         self.workspace.backRequested.connect(self.show_library)
         self.workspace.newInstanceRequested.connect(self.new_instance)
         self.workspace.closeRequested.connect(self.close_session)
+        self.workspace.quickCloseRequested.connect(lambda sess: self.close_session(sess, confirm=False))
         self.drawer.sessionSelected.connect(self.show_session)
         manager.sessionChanged.connect(self._on_session_changed)
         manager.sessionRemoved.connect(lambda s: self._after_session_event(s.tool_id))
@@ -122,8 +123,9 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is stop
 
-    def close_session(self, session: Session) -> None:
-        if session.is_running and not self.confirm_stop_and_close(session):
+    def close_session(self, session: Session, confirm: bool = True) -> None:
+        """Destroy an instance. With confirm=False (tab double-click) a running process is stopped without asking."""
+        if confirm and session.is_running and not self.confirm_stop_and_close(session):
             return
         self.manager.remove(session)                 # destroys output/state; stops a live process
         if not self.manager.sessions:
