@@ -13,6 +13,7 @@ from .active_process_drawer import ActiveProcessDrawer
 from .config import AppConfig
 from .icon_manager import IconManager
 from .library_view import LibraryView
+from .queue_drawer import QueueDrawer
 from .session_manager import Session, SessionManager
 from .tool_registry import ToolRegistry
 from .tool_settings import ToolSettingsDialog
@@ -29,13 +30,15 @@ class Stage(QWidget):
         self.setObjectName("Page")
         self.pages = QStackedWidget(self)
         self.drawer: ActiveProcessDrawer | None = None
+        self.queue_drawer: QueueDrawer | None = None
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         rect = QRect(0, 0, self.width(), self.height())
-        self.pages.setGeometry(rect)                 # pages get the full size; the drawer overlays them
-        if self.drawer is not None:
-            self.drawer.fit_to(rect)
+        self.pages.setGeometry(rect)                 # pages get the full size; the drawers overlay them
+        for d in (self.drawer, self.queue_drawer):
+            if d is not None:
+                d.fit_to(rect)
 
 
 class MainWindow(QMainWindow):
@@ -54,11 +57,15 @@ class MainWindow(QMainWindow):
         self.stage.pages.addWidget(self.workspace)
         self.drawer = ActiveProcessDrawer(manager, icons, self.stage)
         self.stage.drawer = self.drawer
+        self.queue_drawer = QueueDrawer(manager, registry, icons, self.stage)
+        self.stage.queue_drawer = self.queue_drawer
 
         self.library.openRequested.connect(self.open_tool)
         self.library.settingsRequested.connect(self.open_settings)
         self.library.activeRequested.connect(self.drawer.open_drawer)
         self.workspace.backRequested.connect(self.show_library)
+        self.workspace.queueRequested.connect(self.open_queue)
+        self.workspace.currentChanged.connect(self._on_current_session)
         self.workspace.newInstanceRequested.connect(self.new_instance)
         self.workspace.closeRequested.connect(self.close_session)
         self.workspace.quickCloseRequested.connect(lambda sess: self.close_session(sess, confirm=False))
@@ -69,6 +76,7 @@ class MainWindow(QMainWindow):
 
         self.stage.pages.setCurrentWidget(self.library)
         self.drawer.fit_to(QRect(0, 0, self.stage.width(), self.stage.height()))
+        self.queue_drawer.fit_to(QRect(0, 0, self.stage.width(), self.stage.height()))
         if registry.issues:
             log.warning("Tool notices:\n%s", "\n".join(registry.issues))
         if config.notice:
@@ -76,7 +84,17 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ navigation
     def show_library(self) -> None:
+        self.queue_drawer.close_now()                # the queue belongs to the cockpit; it keeps running and is kept
         self.stage.pages.setCurrentWidget(self.library)
+
+    def open_queue(self) -> None:
+        s = self.workspace.current_session()
+        if s is not None:
+            self.queue_drawer.open_for(s)
+
+    def _on_current_session(self, session) -> None:
+        if self.queue_drawer.is_open and session is not self.queue_drawer.session:
+            self.queue_drawer.close_now()
 
     def show_workspace(self) -> None:
         self.stage.pages.setCurrentWidget(self.workspace)
@@ -116,7 +134,13 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Close running instance?")
         box.setText(f"“{self.manager.label(session)}” is still running.")
-        box.setInformativeText("Closing the tab stops the process and discards its output.")
+        info = "Closing the tab stops the process and discards its output."
+        n = len(session.queue.pending_cells())
+        if session.queue.executing:
+            info += f" Its queue is running too: the running cell is stopped and the {n} pending cell{'s' if n != 1 else ''} will not run." if n else " Its queue is running too: the running cell is stopped."
+        elif n:
+            info += f" Its {n} queued cell{'s' if n != 1 else ''} will not run."
+        box.setInformativeText(info)
         stop = box.addButton("Stop and close", QMessageBox.ButtonRole.DestructiveRole)
         box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(box.buttons()[1])
@@ -125,7 +149,7 @@ class MainWindow(QMainWindow):
 
     def close_session(self, session: Session, confirm: bool = True) -> None:
         """Destroy an instance. With confirm=False (tab double-click) a running process is stopped without asking."""
-        if confirm and session.is_running and not self.confirm_stop_and_close(session):
+        if confirm and session.is_active and not self.confirm_stop_and_close(session):
             return
         self.manager.remove(session)                 # destroys output/state; stops a live process
         if not self.manager.sessions:
@@ -158,7 +182,8 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Quit Python Toolbox?")
         box.setText(f"{n} process{'es are' if n != 1 else ' is'} still running.")
-        box.setInformativeText("Quitting stops them.")
+        box.setInformativeText("Quitting stops them. Queued cells that have not run yet will not run "
+                               "(the queue only works while the Toolbox is open).")
         quit_btn = box.addButton("Stop all and quit", QMessageBox.ButtonRole.DestructiveRole)
         box.addButton("Keep running", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(box.buttons()[1])

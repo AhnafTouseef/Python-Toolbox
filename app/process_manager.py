@@ -73,6 +73,21 @@ def resolve_interpreter(tool_dir: Path, global_python: str) -> tuple[str | None,
     return global_python, None, "global"
 
 
+def plan_tool_launch(tool_dir: Path, entry: Path, global_python: str) -> tuple[list[str], str, str]:
+    """The command line that runs a tool: ``([python, "-u", "main.py"], interpreter, source)``.
+
+    Used by the Run button and by queued tool cells so both launch a tool identically (same interpreter
+    rules, same entry-file check).  Raises LaunchError with a user-readable message.
+    """
+    interp, err, source = resolve_interpreter(tool_dir, global_python)
+    if err is None and not entry.is_file():
+        err = (f"{ENTRY_NAME} was not found in\n{tool_dir}\n"
+               f"The tool folder may have been moved, renamed or emptied since the toolbox started.")
+    if err is not None:
+        raise LaunchError(err)
+    return [interp, "-u", ENTRY_NAME], interp, source
+
+
 def describe_exit(code: int) -> str:
     """Human-readable exit status. Negative codes are POSIX signals; huge ones are Windows NTSTATUS values."""
     if code < 0:
@@ -165,7 +180,10 @@ class ProcessRunner(QObject):
         return bool(self._handle and self._handle.stop_requested)
 
     # ------------------------------------------------------------------ start
-    def start(self, argv: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> None:
+    def start(self, argv: list[str] | str, cwd: str, extra_env: dict[str, str] | None = None) -> None:
+        """Start a process. ``argv`` is a list, or (Windows only, used for cmd.exe command lines whose quoting
+        must be passed through untouched) a complete command line string."""
+        program = argv if isinstance(argv, str) else argv[0]
         if self._handle is not None:
             raise LaunchError("This instance is already running.")
         if not os.path.isdir(cwd):
@@ -184,11 +202,11 @@ class ProcessRunner(QObject):
         try:
             proc = subprocess.Popen(argv, **kwargs)
         except FileNotFoundError:
-            raise LaunchError(f"Could not start the interpreter: file not found\n{argv[0]}") from None
+            raise LaunchError(f"Could not start the interpreter: file not found\n{program}") from None
         except PermissionError as exc:
-            raise LaunchError(f"Permission denied when starting {argv[0]}: {exc}") from None
+            raise LaunchError(f"Permission denied when starting {program}: {exc}") from None
         except (OSError, ValueError) as exc:
-            raise LaunchError(f"Could not start {argv[0]}: {exc}") from None
+            raise LaunchError(f"Could not start {program}: {exc}") from None
 
         h = _Handle(proc)
         self._handle = h

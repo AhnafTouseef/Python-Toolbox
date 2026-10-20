@@ -1,28 +1,19 @@
 """Active-process drawer: a right-anchored overlay listing running instances.
 
-It is a child of the stage widget that holds the pages, stacked above them, so the library
-grid underneath is never resized or re-laid-out.  Only the panel's x position is animated
-(one cheap move per frame); the dimmed scrim behind it is static.
+The overlay behaviour (layer above the pages, sliding panel, scrim, Esc) lives in SlideDrawer, which the
+queue drawer shares; this class only adds the list of running instances.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, Qt, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QShortcut, QKeySequence
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QToolButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from . import theme
 from .icon_manager import IconManager
 from .session_manager import Session, SessionManager
-
-MIN_W, MAX_W = 300, 460
-ANIM_MS = 180
-
-
-def drawer_width(window_width: int) -> int:
-    """About one third of the window, within sensible limits (and never wider than the window)."""
-    return max(1, min(window_width, max(MIN_W, min(MAX_W, window_width // 3))))
+from .slide_drawer import ANIM_MS, MAX_W, MIN_W, SlideDrawer, drawer_width  # noqa: F401  (re-exported)
 
 
 class DrawerItem(QPushButton):
@@ -56,7 +47,10 @@ class DrawerItem(QPushButton):
         title = QLabel(label)
         title.setStyleSheet("font-weight: 600; background: transparent;")
         started = session.started_at.strftime("%H:%M:%S") if session.started_at else ""
-        sub = QLabel(f"PID {session.pid} · started {started}" if session.pid else f"started {started}")
+        if session.queue.busy and not session.is_running:
+            sub = QLabel(f"Queue · {session.queue.state_text}")
+        else:
+            sub = QLabel(f"PID {session.pid} · started {started}" if session.pid else f"started {started}")
         sub.setObjectName("Muted")
         sub.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px; background: transparent;")
         for w in (title, sub):
@@ -74,24 +68,13 @@ class DrawerItem(QPushButton):
         lay.addWidget(dot)
 
 
-class ActiveProcessDrawer(QWidget):
-    """Full-size transparent layer (catches clicks outside the panel) + the sliding panel."""
-
+class ActiveProcessDrawer(SlideDrawer):
     sessionSelected = Signal(object)
 
     def __init__(self, manager: SessionManager, icons: IconManager, parent: QWidget):
         super().__init__(parent)
         self._manager = manager
         self._icons = icons
-        self._open = False
-        self.setObjectName("DrawerLayer")
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.hide()
-
-        self.panel = QFrame(self)
-        self.panel.setObjectName("DrawerPanel")
-        self.panel.setStyleSheet(f"#DrawerPanel {{ background: {theme.PANEL}; border: none;"
-                                 f" border-left: 1px solid {theme.BORDER_STRONG}; }}")
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         self._title = QLabel("Running")
@@ -129,63 +112,17 @@ class ActiveProcessDrawer(QWidget):
         pl.addWidget(self._empty)
         pl.addWidget(self.scroll, 1)
 
-        self._anim = QPropertyAnimation(self.panel, b"pos", self)
-        self._anim.setDuration(ANIM_MS)
-        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._anim.finished.connect(self._on_anim_finished)
-
         self.close_button.clicked.connect(self.close_drawer)
-        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
-        esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        esc.activated.connect(self.close_drawer)
-
         for sig in (manager.sessionAdded, manager.sessionRemoved, manager.sessionChanged):
             sig.connect(self._on_manager_event)
         self._dirty = False
 
-    # ------------------------------------------------------------------ geometry
-    @property
-    def is_open(self) -> bool:
-        return self._open
-
-    def fit_to(self, rect) -> None:
-        """Called by the stage whenever it is resized: the layer covers it, the panel stays on the right edge."""
-        self.setGeometry(rect)
-        w = drawer_width(rect.width())
-        self.panel.resize(w, rect.height())
-        if self._anim.state() != QPropertyAnimation.State.Running:
-            self.panel.move(rect.width() - w if self._open else rect.width(), 0)
-        else:
-            self._anim.setEndValue(QPoint(rect.width() - w if self._open else rect.width(), 0))
-
-    # ------------------------------------------------------------------ open / close
-    def open_drawer(self) -> None:
-        if self._open:
-            return
-        self._open = True
+    # ------------------------------------------------------------------ open / close hooks
+    def prepare_open(self) -> None:
         self.rebuild()
-        self.show()
-        self.raise_()
-        w = drawer_width(self.width())
-        self.panel.resize(w, self.height())
-        self._slide(QPoint(self.width(), 0), QPoint(self.width() - w, 0))
+
+    def focus_on_open(self) -> None:
         self.close_button.setFocus()
-
-    def close_drawer(self) -> None:
-        if not self._open:
-            return
-        self._open = False
-        self._slide(self.panel.pos(), QPoint(self.width(), 0))
-
-    def _slide(self, start: QPoint, end: QPoint) -> None:
-        self._anim.stop()
-        self._anim.setStartValue(start)
-        self._anim.setEndValue(end)
-        self._anim.start()
-
-    def _on_anim_finished(self) -> None:
-        if not self._open:
-            self.hide()
 
     # ------------------------------------------------------------------ list
     def _on_manager_event(self, *_args) -> None:
@@ -215,23 +152,3 @@ class ActiveProcessDrawer(QWidget):
     def _select(self, session: Session) -> None:
         self.close_drawer()
         self.sessionSelected.emit(session)
-
-    # ------------------------------------------------------------------ painting / input
-    def paintEvent(self, _event) -> None:
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(0, 0, 0, 110))        # static scrim
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if not self.panel.geometry().contains(event.position().toPoint()):
-            self.close_drawer()
-        event.accept()
-
-    def wheelEvent(self, event) -> None:
-        event.accept()                                       # nothing scrolls underneath while open
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() == Qt.Key.Key_Escape:
-            self.close_drawer()
-            event.accept()
-        else:
-            super().keyPressEvent(event)

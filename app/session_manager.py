@@ -20,7 +20,8 @@ from enum import Enum
 from PySide6.QtCore import QObject, Signal
 
 from .config import AppConfig
-from .process_manager import ENTRY_NAME, LaunchError, ProcessRunner, describe_exit, resolve_interpreter
+from .process_manager import ENTRY_NAME, LaunchError, ProcessRunner, describe_exit, plan_tool_launch
+from .session_queue import SessionQueue
 from .tool_registry import ToolInfo, ToolRegistry
 
 log = logging.getLogger(__name__)
@@ -48,8 +49,12 @@ STATUS_TEXT = {
 class Session(QObject):
     statusChanged = Signal(object)            # self
     output = Signal(str, str)                 # kind ("stdout" | "stderr" | "input" | "system"), text
+    # The main process is over: (exit code, stopped by the user). The code is None when it could not be launched.
+    # The session's queue listens to this - it is the real exit event, not a guess from output or timing.
+    exited = Signal(object, bool)
 
-    def __init__(self, tool: ToolInfo, ordinal: int, config: AppConfig, parent: QObject | None = None):
+    def __init__(self, tool: ToolInfo, ordinal: int, config: AppConfig, parent: QObject | None = None,
+                 registry: ToolRegistry | None = None):
         super().__init__(parent)
         self.id = uuid.uuid4().hex[:10]
         self.tool = tool
@@ -65,6 +70,7 @@ class Session(QObject):
         self.runner.output.connect(self.output)
         self.runner.finished.connect(self._on_finished)
         self.runner.stdinFailed.connect(lambda: self._system("(The script is no longer reading input.)"))
+        self.queue = SessionQueue(self, config, registry.get if registry is not None else None)
 
     # ------------------------------------------------------------------ queries
     @property
@@ -74,6 +80,11 @@ class Session(QObject):
     @property
     def is_running(self) -> bool:
         return self.status is SessionStatus.RUNNING
+
+    @property
+    def is_active(self) -> bool:
+        """The main process is running, or this instance's queue is executing / still has a live process."""
+        return self.is_running or self.queue.busy
 
     @property
     def stopping(self) -> bool:
@@ -103,7 +114,7 @@ class Session(QObject):
     # ------------------------------------------------------------------ run / stop
     def run(self) -> None:
         """Start a fresh process for this instance; output is appended below the previous runs."""
-        if self.is_running:
+        if self.is_running or self.queue.busy:      # a queue that is executing owns this instance until it is done
             return
         self.run_count += 1
         now = datetime.now()
@@ -112,13 +123,7 @@ class Session(QObject):
         self._system(f"──────── Run {self.run_count} · {now:%Y-%m-%d %H:%M:%S} ────────")
         self.exit_code = None
         try:
-            interp, err, source = resolve_interpreter(self.tool.path, self._config.resolved_global_python())
-            if err is None and not self.tool.entry.is_file():
-                err = (f"{ENTRY_NAME} was not found in\n{self.tool.path}\n"
-                       f"The tool folder may have been moved, renamed or emptied since the toolbox started.")
-            if err is not None:
-                raise LaunchError(err)
-            argv = [interp, "-u", ENTRY_NAME]
+            argv, interp, source = plan_tool_launch(self.tool.path, self.tool.entry, self._config.resolved_global_python())
             self._system(f"> {interp} -u {ENTRY_NAME}   ({'tool .venv' if source == 'venv' else 'global Python'})")
             self._system(f"  in {self.tool.path}")
             self.runner.start(argv, str(self.tool.path))
@@ -127,12 +132,14 @@ class Session(QObject):
             self.detail = str(exc).splitlines()[0]
             self.output.emit("stderr", f"Could not start “{self.tool.meta.name}”:\n{exc}\n")
             self._set_status(SessionStatus.ERROR)
+            self.exited.emit(None, False)
             return
         except Exception as exc:                    # never let one tool take the UI down
             log.exception("Unexpected failure while starting %s", self.tool.id)
             self.detail = str(exc)
             self.output.emit("stderr", f"Unexpected error while starting “{self.tool.meta.name}”: {exc}\n")
             self._set_status(SessionStatus.ERROR)
+            self.exited.emit(None, False)
             return
         self.started_at = now
         self._set_status(SessionStatus.RUNNING)
@@ -164,6 +171,7 @@ class Session(QObject):
             status, mark = SessionStatus.FAILED, "✖ Failed"
         self._system(f"{mark} ({describe_exit(code)})")
         self._set_status(status)
+        self.exited.emit(code, stop_requested)
 
     def kill_now(self) -> None:
         self.runner.kill_now()
@@ -189,8 +197,9 @@ class SessionManager(QObject):
         if tool is None:
             raise KeyError(tool_id)
         ordinal = next(self._ordinals.setdefault(tool_id, itertools.count(1)))
-        s = Session(tool, ordinal, self._config)
+        s = Session(tool, ordinal, self._config, registry=self._registry)
         s.statusChanged.connect(self._on_status)
+        s.queue.stateChanged.connect(lambda sess=s: self.sessionChanged.emit(sess))   # queue started / finished: refresh badges
         self.sessions.append(s)
         self.touch(s)
         self.sessionAdded.emit(s)
@@ -206,16 +215,21 @@ class SessionManager(QObject):
         if session not in self.sessions:
             return
         self.sessions.remove(session)
-        if session.is_running:
+        session.queue.discard()                      # nothing queued may start any more; a live cell is stopped
+        if session.is_active:
             self._dying.add(session)
             session.runner.finished.connect(lambda *_: self._reap(session))
-            session.runner.interrupt_grace = min(session.runner.interrupt_grace, 2.0)
-            session.stop()
+            session.queue.settled.connect(lambda *_: self._reap(session))
+            if session.is_running:
+                session.runner.interrupt_grace = min(session.runner.interrupt_grace, 2.0)
+                session.stop()
         else:
             session.deleteLater()
         self.sessionRemoved.emit(session)
 
     def _reap(self, session: Session) -> None:
+        if session.is_active or session not in self._dying:      # main process or a queue cell is still alive
+            return
         self._dying.discard(session)
         session.deleteLater()
 
@@ -224,6 +238,7 @@ class SessionManager(QObject):
         for s in list(self.sessions) + list(self._dying):
             if s.is_running:
                 s.kill_now()
+            s.queue.kill_now()
 
     # ------------------------------------------------------------------ queries
     def get(self, session_id: str) -> Session | None:
@@ -240,7 +255,8 @@ class SessionManager(QObject):
         session.last_active = next(self._clock)
 
     def running(self) -> list[Session]:
-        return sorted((s for s in self.sessions if s.is_running), key=lambda s: s.started_at or datetime.min)
+        """Instances with something alive: the main process, or a queued cell that is executing."""
+        return sorted((s for s in self.sessions if s.is_active), key=lambda s: s.started_at or datetime.min)
 
     def label(self, session: Session) -> str:
         tool = self._registry.get(session.tool_id)
@@ -250,7 +266,7 @@ class SessionManager(QObject):
     def tool_status(self, tool_id: str) -> tuple[str | None, int]:
         """What a library card shows: running (with count) wins; otherwise the latest finished outcome."""
         mine = self.for_tool(tool_id)
-        n = sum(1 for s in mine if s.is_running)
+        n = sum(1 for s in mine if s.is_active)
         if n:
             return SessionStatus.RUNNING.value, n
         done = [s for s in mine if s.status is not SessionStatus.IDLE]

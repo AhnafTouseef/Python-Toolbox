@@ -78,6 +78,7 @@ class WorkspaceView(QWidget):
     closeRequested = Signal(object)        # Session: the user clicked a tab's close button (asks if running)
     quickCloseRequested = Signal(object)   # Session: the user double-clicked a tab (stops and closes, no question)
     currentChanged = Signal(object)        # Session or None
+    queueRequested = Signal()              # the Queue button: open the current session's queue drawer
 
     def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager,
                  parent: QWidget | None = None):
@@ -136,12 +137,17 @@ class WorkspaceView(QWidget):
         self.status = QLabel()
         self.status.setMinimumWidth(40)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.queue_button = QPushButton(" Queue")
+        self.queue_button.setIcon(icons.icon("list-checks", theme.TEXT, 16))
+        self.queue_button.setAccessibleName("Open the queue")
+        self.queue_button.setToolTip("Cells that run one after another once the main process has finished")
         self.run_button = QPushButton("Run")
         self.run_button.setObjectName("Primary")
         self.run_button.setMinimumWidth(96)
         bl.addWidget(self.tile)
         bl.addWidget(self.title, 3)
         bl.addWidget(self.status, 2)
+        bl.addWidget(self.queue_button)
         bl.addWidget(self.run_button)
 
         self.stack = QStackedWidget()
@@ -160,6 +166,7 @@ class WorkspaceView(QWidget):
         self.back_button.clicked.connect(self.backRequested)
         self.plus_button.clicked.connect(self.newInstanceRequested)
         self.run_button.clicked.connect(self._run_or_stop)
+        self.queue_button.clicked.connect(self.queueRequested)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBarDoubleClicked.connect(self._tab_double_clicked)
         manager.sessionAdded.connect(self.add_session)
@@ -197,6 +204,8 @@ class WorkspaceView(QWidget):
         close.setAccessibleName("Close instance")
         close.clicked.connect(lambda _=False, sid=session.id: self._close_clicked(sid))
         self.tabs.setTabButton(idx, QTabBar.ButtonPosition.RightSide, close)
+        session.queue.structureChanged.connect(lambda s=session: self._queue_changed(s))
+        session.queue.stateChanged.connect(lambda s=session: self._queue_changed(s))
         self.refresh_all()
 
     def remove_session(self, session: Session) -> None:
@@ -224,6 +233,10 @@ class WorkspaceView(QWidget):
         s = self._manager.get(self.tabs.tabData(index))
         if s is not None:
             self.quickCloseRequested.emit(s)
+
+    def _queue_changed(self, session: Session) -> None:
+        if session is self.current_session():
+            self._sync_header()
 
     def _close_clicked(self, session_id: str) -> None:
         s = self._manager.get(session_id)
@@ -278,20 +291,30 @@ class WorkspaceView(QWidget):
 
     def _sync_header(self) -> None:
         s = self.current_session()
-        self.run_button.setEnabled(s is not None)
+        self.run_button.setEnabled(s is not None and not (s.queue.busy and not s.is_running))
         self.plus_button.setEnabled(s is not None)
+        self.queue_button.setEnabled(s is not None)
         if s is None:
+            self.queue_button.setText(" Queue")
             self.title.setText("")
             self.status.setText("")
             self.tile.clear()
             self.run_button.setText("Run")
             return
         m = s.tool.meta
+        q = s.queue
+        pending = len(q.pending_cells())
+        self.queue_button.setText(f" Queue · {len(q.cells)}" if q.cells else " Queue")
+        self.queue_button.setToolTip(f"Queue: {q.state_text}" + (f" ({pending} pending)" if pending else ""))
         self.tile.setPixmap(self._icons.pixmap(m.icon, m.color, 24))
         self.title.setText(self._manager.label(s))
         self.title.setToolTip(str(s.tool.path))
         color = STATUS_COLORS[s.status]
-        self.status.setText(f"●  {s.status_text}")
+        if q.busy and not s.is_running:
+            self.status.setText(f"●  Queue · {q.state_text}")
+            color = theme.OK
+        else:
+            self.status.setText(f"●  {s.status_text}")
         self.status.setStyleSheet(f"color: {color};")
         self.status.setToolTip(s.detail if s.status is SessionStatus.ERROR else "")
         if s.is_running:
@@ -308,7 +331,8 @@ class WorkspaceView(QWidget):
         else:
             self.run_button.setText("Run" if s.run_count == 0 else "Run again")
             self.run_button.setIcon(self._icons.icon("play", theme.TEXT, 16))
-            self.run_button.setToolTip("Start a new process; its output is appended below")
+            self.run_button.setToolTip("Start a new process; its output is appended below" if not (q.busy)
+                                       else "Unavailable while this instance's queue is running")
             self.run_button.setObjectName("Primary")
         self.run_button.style().unpolish(self.run_button)
         self.run_button.style().polish(self.run_button)
