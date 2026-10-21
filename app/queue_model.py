@@ -18,6 +18,11 @@ class CellKind(str, Enum):
     TOOL = "tool"      # an existing tool, launched exactly like the Run button launches it
 
 
+LANG_PYTHON = "python"     # a code cell's text is Python source, run by the tool's interpreter
+LANG_SHELL = "shell"       # ... or a shell command / batch script (cmd.exe on Windows, /bin/sh elsewhere)
+LANGUAGE_NAMES = {LANG_PYTHON: "Python", LANG_SHELL: "Shell"}
+
+
 class CellStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -75,13 +80,18 @@ def parse_answers(text: str) -> list[str]:
 class QueueCell:
     kind: CellKind
     label: str = ""                    # optional name chosen by the user
-    command: str = ""                  # CODE: the command / script text
+    command: str = ""                  # CODE: the Python source / shell command text
+    language: str = LANG_PYTHON        # CODE: LANG_PYTHON | LANG_SHELL
     tool_id: str = ""                  # TOOL: the registered tool
     answers_text: str = ""             # predefined answers, comma separated (as typed)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
 
     # -- results (filled in while / after the cell runs) ------------------------------
     status: CellStatus = CellStatus.PENDING
+    # When a queue run ends every cell goes back to PENDING (editable, ready for the next run). What happened in
+    # that run stays readable: last_status says how it ended, and reason / exit_code / output etc. keep their
+    # values until the cell runs again.
+    last_status: CellStatus | None = None
     reason: str = ""                   # why it failed / was skipped / cancelled
     exit_code: int | None = None
     pid: int | None = None
@@ -98,6 +108,13 @@ class QueueCell:
     @property
     def answers(self) -> list[str]:
         return parse_answers(self.answers_text)
+
+    @property
+    def result(self) -> CellStatus:
+        """What to show: the live status, or - for a cell that is pending again - how its last run ended."""
+        if self.status is CellStatus.PENDING and self.last_status is not None:
+            return self.last_status
+        return self.status
 
     @property
     def is_pending(self) -> bool:
@@ -125,8 +142,15 @@ class QueueCell:
     def output_text(self) -> str:
         return "".join(t for k, t in self.output if k != "input")
 
+    def rearm(self) -> None:
+        """The queue run is over: make the cell pending (editable) again, remembering how this run ended."""
+        if self.status is not CellStatus.PENDING:
+            self.last_status = self.status
+            self.status = CellStatus.PENDING
+
     def reset_run_state(self) -> None:
         self.status = CellStatus.PENDING
+        self.last_status = None
         self.reason = ""
         self.exit_code = None
         self.pid = None
@@ -141,10 +165,9 @@ class QueueCell:
 
     # -- display ----------------------------------------------------------------------
     def summary(self, tool_name: str | None = None) -> str:
-        """Short title for the list: the user's name, else the tool name / first line of the command."""
+        """Short title for the list: the user's name, else the tool name / kind of code."""
         if self.label.strip():
             return self.label.strip()
         if self.kind is CellKind.TOOL:
             return tool_name or self.tool_id or "(no tool)"
-        first = next((ln.strip() for ln in self.command.splitlines() if ln.strip()), "")
-        return first or "(empty command)"
+        return "Python code" if self.language == LANG_PYTHON else "Shell command"

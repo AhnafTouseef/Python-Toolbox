@@ -106,10 +106,15 @@ right-side drawer that overlays the cockpit exactly like the active-process draw
 never resized). Use it to prepare work while a long job is still running; the cells run one after another once
 the main process has **exited**.
 
-* **Cells.** *Code cell* - a command or script. It runs with the system shell (Windows: `cmd.exe`, the text is
-  run as a batch script; elsewhere `/bin/sh`) in the tool's folder, and the output header says so. *Tool cell* -
-  any tool in `tools/`, launched through the same code as the Run button (its own `.venv` interpreter if it has
-  one, otherwise the global Python; a `.venv` without an interpreter is an error, never a silent fallback).
+* **Notebook-style cells.** The drawer works like a notebook. In the blank space (and after the last cell) there
+  are two buttons, **+ Code** and **+ Tool**; hovering over a cell opens the same two buttons right below it (and
+  above the first cell), so a cell can be inserted anywhere between two others.
+  *Code cell* - its code is edited right in the card. The language selector defaults to **Python**: the code is run
+  by the tool's interpreter (its `.venv`, otherwise the global Python) in the tool's folder, exactly like a script
+  (`__name__ == "__main__"`, the tool folder is importable, tracebacks show the source line). **Shell** runs the
+  text as a command / batch script instead (Windows: `cmd.exe`; elsewhere `/bin/sh`). An empty cell completes at
+  once without starting a process. *Tool cell* - any tool in `tools/`, launched through the same code as the Run
+  button (a `.venv` without an interpreter is an error, never a silent fallback); the pencil button changes the tool.
   Adding or editing a cell never runs anything.
 * **When it starts.** Only on the real exit event of the main process, never from output silence or timing.
   *Must Execute off*: the queue runs only if the main process exited with code 0 and was not stopped by you;
@@ -119,14 +124,18 @@ the main process has **exited**.
 * **Strictly sequential.** One cell at a time, in the displayed order; the next one starts only after the previous
   process has exited and its output was delivered. Each cell has its own process, pipes, output and result; its
   input never reaches the main process or another cell.
-* **While it is waiting** you can add, edit, reorder (arrow buttons) and remove pending cells. Once a cell has
-  started its configuration is frozen; pending cells stay editable while another one runs. Finished cells keep
-  their status, exit code and output (**Output** button: live terminal plus the normal input line). **Stop queue**
-  stops the running cell (Ctrl+C, then terminate, then kill; a second press forces it) and cancels the rest.
+* **Output and input below the cell.** Each cell shows what it printed in its own output area directly under
+  it (the **Output** button hides it). While a cell runs, an input line sits right below that output, like
+  `input()` in Jupyter: when the cell waits for input the line is highlighted and focused, type and press Enter.
+* **Editable again after every run.** When a queue run ends, every cell goes back to *Pending* - editable,
+  reorderable, removable - so the whole queue can be reused for the next run of the tool. What happened stays
+  visible until the cell runs again ("Pending - last run: Completed in 0:03", with its output). While a cell is
+  running its configuration is frozen; pending cells stay editable while another one runs. **Stop queue** stops
+  the running cell (Ctrl+C, then terminate, then kill; a second press forces it) and cancels the rest.
 * **Predefined answers (paperclip).** `1920, 1080, yes` (whitespace around answers is trimmed; commas cannot be part
   of an answer; an empty entry between commas is an empty line). Answers are typed one per input request, only
   while the process is actually waiting, never all at once. Unused answers are reported; when a cell asks for more
-  than were given, the Output page's input line works as usual.
+  than were given, the cell's input line works as usual.
 * **Session ownership.** The queue belongs to its instance and lives as long as the instance does: going back to
   the library does not touch it (the drawer closes, the queue keeps going), and finishing the main process does
   not discard it. Closing the instance (or quitting) stops a running cell and drops the rest - the queue is best
@@ -144,7 +153,7 @@ is in progress. The queue polls that folder, so:
 
 | Cell | "Waiting for input" | Answers sent | 5-minute timeout (Must Execute on) |
 |---|---|---|---|
-| Tool cell, or `python ...` started by a code cell | exact | when a read really blocks (one answer per request) | yes: blocked 300 s with no answer left -> stopped, **Failed - input timeout (5 minutes)**, the process is waited for, then the next cell starts |
+| Tool cell, Python code cell, or `python ...` started by a shell cell | exact | when a read really blocks (one answer per request) | yes: blocked 300 s with no answer left -> stopped, **Failed - input timeout (5 minutes)**, the process is waited for, then the next cell starts |
 | Anything else (`.exe`, `.bat` commands, `python -I`, ...) | not knowable, never claimed | when the output stops on an unfinished prompt line (e.g. `Continue? `) for 0.6 s | **never** (it could kill long work) |
 
 The timeout measures *time blocked on input*, never running time or output silence: a three-hour render is never
@@ -187,7 +196,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-196 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+217 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output
@@ -236,7 +245,7 @@ app/
   session_queue.py          the sequential engine: Must Execute, answers, input timeout
   stdin_watch.py            Toolbox side of input detection (marker folder)
   stdin_probe/              sitecustomize.py injected into queued Python processes - nothing else may live here
-  queue_drawer.py           queue drawer: cell list, paperclip answers, editor, output page
+  queue_drawer.py           queue drawer: notebook-style cells, insert bars, inline code/output/input, switch
   gc_guard.py               keeps Python's GC on the GUI thread (see source)
   error_reporting.py        unexpected-error dialog, always shown from the GUI thread
   theme.py                  dark palette and stylesheet
@@ -251,7 +260,7 @@ in it (Windows exit codes such as `0xC000013A` exceed a signed 32-bit int), whic
 and covered by tests that simulate such codes. Please keep exercising Stop on Windows with a
 script in `input()`, a `time.sleep()` loop, and one that spawns a child process.
 
-The queue's Windows-specific parts are also untested on a real Windows machine: code cells run through a
+The queue's Windows-specific parts are also untested on a real Windows machine: Shell code cells run through a
 generated `.cmd` file (`cmd.exe /d /s /c ""file""`, covered only by a test of the command line and file content),
-and a timed-out cell is stopped through the same Ctrl+C/taskkill path as Stop. Please try a code cell with a
-quoted path, a Python tool cell with `input()` and predefined answers, and a short timeout trial.
+and a timed-out cell is stopped through the same Ctrl+C/taskkill path as Stop. Python code cells use the same path as tool cells (the interpreter is started directly with a generated `.py`). Please try a Shell cell with a
+quoted path, a Python code cell with `input()`, a Python tool cell with `input()` and predefined answers, and a short timeout trial.

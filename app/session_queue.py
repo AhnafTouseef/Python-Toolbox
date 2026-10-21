@@ -36,8 +36,9 @@ from typing import Callable
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .config import AppConfig
-from .process_manager import ENTRY_NAME, IS_WINDOWS, LaunchError, ProcessRunner, describe_exit, plan_tool_launch
-from .queue_model import (INPUT_TIMEOUT_REASON, CellKind, CellStatus, QueueCell, QueueState)
+from .process_manager import (ENTRY_NAME, IS_WINDOWS, LaunchError, ProcessRunner, describe_exit, plan_tool_launch,
+                              resolve_interpreter)
+from .queue_model import (INPUT_TIMEOUT_REASON, LANG_PYTHON, LANG_SHELL, CellKind, CellStatus, QueueCell, QueueState)
 from .stdin_watch import StdinProbe
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,19 @@ def build_shell_command(text: str, workdir: Path, windows: bool | None = None) -
     comspec = os.environ.get("COMSPEC") or "cmd.exe"
     # `/s` + doubled quotes is cmd's documented way to keep a quoted path (spaces, parentheses) intact.
     return ShellPlan(f'"{comspec}" /d /s /c ""{script}""', "cmd.exe /c  (batch script, runs in the tool folder)", script)
+
+
+# Runs the cell's source in __main__ (so ``if __name__ == "__main__"`` works), with the tool folder as the
+# import root (``-c`` puts "" first on sys.path) and the real file name in tracebacks.
+_PY_BOOTSTRAP = ("import sys;p=sys.argv[1];sys.argv=[p]+sys.argv[2:];"
+                 "exec(compile(open(p,encoding='utf-8').read(),p,'exec'))")
+
+
+def build_python_command(code: str, workdir: Path, interpreter: str) -> ShellPlan:
+    """A Python code cell: the text is saved as ``cell.py`` and run unbuffered by the tool's interpreter."""
+    script = Path(workdir) / "cell.py"
+    script.write_text(code.replace("\r\n", "\n"), encoding="utf-8", newline="\n")
+    return ShellPlan([interpreter, "-u", "-c", _PY_BOOTSTRAP, str(script)], "", script)
 
 
 # --------------------------------------------------------------------------- one run of one cell
@@ -167,6 +181,8 @@ class SessionQueue(QObject):
         s = self.state
         if s is QueueState.EMPTY:
             return "No cells yet"
+        if s is QueueState.NOT_RUN:
+            return self._detail
         if s is QueueState.WAITING:
             if self.session.is_running:
                 return "Waiting for the main process to finish"
@@ -177,7 +193,7 @@ class SessionQueue(QObject):
             if cur is not None:
                 return f"Running cell {self.index_of(cur) + 1} of {n}"
             return "Starting the next cell…"
-        return self._detail
+        return f"Last run: {self._detail}. The cells are ready for the next run."
 
     # ------------------------------------------------------------------ state helpers
     def _set_state(self, state: QueueState, detail: str = "") -> None:
@@ -192,29 +208,31 @@ class SessionQueue(QObject):
         """Recompute the resting state after cells changed or the main process started."""
         if self.state is QueueState.EXECUTING:
             return
-        pending = bool(self.pending_cells())
         if not self.cells:
             self._set_state(QueueState.EMPTY)
-        elif pending:
-            if self.state is QueueState.NOT_RUN and not self.session.is_running:
-                return                                           # keep explaining why nothing ran
-            self._set_state(QueueState.WAITING)
-        elif self._final is not None:
-            self._set_state(*self._final)
+        elif self.state in (QueueState.NOT_RUN, QueueState.COMPLETED, QueueState.STOPPED):
+            if self.session.is_running:
+                self._set_state(QueueState.WAITING)              # a new main run: armed again
+            # otherwise keep showing how the last run went; the cells are pending (ready) anyway
         else:
-            self._set_state(QueueState.COMPLETED, "Completed")
+            self._set_state(QueueState.WAITING)
 
     def _on_session_status(self, _session) -> None:
-        if self.state is QueueState.NOT_RUN and self.session.is_running:
-            self._refresh_idle_state()                           # main process restarted: armed again
+        if self.state in (QueueState.NOT_RUN, QueueState.COMPLETED, QueueState.STOPPED) and self.session.is_running:
+            self._refresh_idle_state()
         elif self.state is QueueState.WAITING:
             self.stateChanged.emit()                             # wording depends on "main is running"
 
     # ------------------------------------------------------------------ editing (GUI actions)
     def add_cell(self, kind: CellKind, *, label: str = "", command: str = "", tool_id: str = "",
-                 answers_text: str = "") -> QueueCell:
-        cell = QueueCell(kind=kind, label=label.strip(), command=command, tool_id=tool_id, answers_text=answers_text)
-        self.cells.append(cell)
+                 answers_text: str = "", language: str = LANG_PYTHON, index: int | None = None) -> QueueCell:
+        """Add a cell at ``index`` (default: the end). Cells that are running are never displaced."""
+        cell = QueueCell(kind=kind, label=label.strip(), command=command, tool_id=tool_id, answers_text=answers_text,
+                         language=language if language in (LANG_PYTHON, LANG_SHELL) else LANG_PYTHON)
+        if index is None or index >= len(self.cells):
+            self.cells.append(cell)
+        else:
+            self.cells.insert(max(0, index), cell)
         self._refresh_idle_state()
         self.structureChanged.emit()
         return cell
@@ -224,7 +242,7 @@ class SessionQueue(QObject):
         cell = self.cell(cell_id)
         if cell is None or not cell.is_pending:
             return False
-        for key in ("kind", "label", "command", "tool_id", "answers_text"):
+        for key in ("kind", "label", "command", "tool_id", "answers_text", "language"):
             if key in fields:
                 value = fields[key]
                 setattr(cell, key, value.strip() if key == "label" else value)
@@ -303,6 +321,8 @@ class SessionQueue(QObject):
         self._start_cell(cell)
 
     def _finish(self, state: QueueState, detail: str) -> None:
+        for c in self.cells:
+            c.rearm()                                            # editable again; the result stays readable
         self._set_state(state, detail)
         self.structureChanged.emit()
         self.settled.emit()
@@ -331,9 +351,18 @@ class SessionQueue(QObject):
             argv, interp, source = plan_tool_launch(tool.path, tool.entry, self._config.resolved_global_python())
             return argv, str(tool.path), [f"> {interp} -u {ENTRY_NAME}   ({'tool .venv' if source == 'venv' else 'global Python'})",
                                           f"  in {tool.path}"]
-        if not cell.command.strip():
-            raise LaunchError("This code cell has no command.")
         cwd = str(self.session.tool.path)
+        if cell.language == LANG_PYTHON:
+            # The cell runs with the interpreter of the tool this queue belongs to (its .venv, else the global one).
+            interp, err, source = resolve_interpreter(self.session.tool.path, self._config.resolved_global_python())
+            if err is not None:
+                raise LaunchError(err)
+            try:
+                plan = build_python_command(cell.command, workdir, interp)
+            except OSError as exc:
+                raise LaunchError(f"Could not prepare the code: {exc}") from None
+            return plan.argv, cwd, [f"> {interp} -u   (Python code, {'tool .venv' if source == 'venv' else 'global Python'})",
+                                    f"  in {cwd}"]
         try:
             plan = build_shell_command(cell.command, workdir)
         except OSError as exc:
@@ -343,11 +372,17 @@ class SessionQueue(QObject):
     def _start_cell(self, cell: QueueCell) -> None:
         index = self.index_of(cell) + 1
         now = datetime.now()
+        cell.reset_run_state()                                   # forget the previous run's output / result
         cell.status = CellStatus.RUNNING
         cell.started_at = now
         cell.detection = "none"
+        self.cellChanged.emit(cell)                              # views drop the previous run's output now
         kind_name = "Tool" if cell.kind is CellKind.TOOL else "Code"
         self._system(cell, f"──────── Cell {index} · {kind_name} · {now:%Y-%m-%d %H:%M:%S} ────────")
+        if cell.kind is CellKind.CODE and not cell.command.strip():
+            self._system(cell, "(Empty cell — nothing to run.)")
+            self._end_cell(cell, CellStatus.COMPLETED, "", 0)
+            return
         probe = StdinProbe()
         runner = ProcessRunner(self)
         runner.merge_stderr = self.merge_output
