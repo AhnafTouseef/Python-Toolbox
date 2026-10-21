@@ -261,6 +261,8 @@ class SessionManager(QObject):
     def label(self, session: Session) -> str:
         tool = self._registry.get(session.tool_id)
         name = tool.meta.name if tool else session.tool.meta.name
+        if tool is not None and tool.tag:
+            name = f"{name} ({tool.tag})"                    # another tool has the same name: say which path
         return f"{name} #{session.ordinal}" if len(self.for_tool(session.tool_id)) > 1 else name
 
     def tool_status(self, tool_id: str) -> tuple[str | None, int]:

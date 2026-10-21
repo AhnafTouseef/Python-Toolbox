@@ -6,7 +6,7 @@ import logging
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QMainWindow, QMessageBox, QStackedWidget, QWidget
+from PySide6.QtWidgets import QDialog, QMainWindow, QMessageBox, QStackedWidget, QWidget
 
 from . import theme
 from .active_process_drawer import ActiveProcessDrawer
@@ -15,6 +15,8 @@ from .icon_manager import IconManager
 from .library_view import LibraryView
 from .queue_drawer import QueueDrawer
 from .session_manager import Session, SessionManager
+from .presets import PresetStore
+from .tool_folders import ToolFoldersDialog
 from .tool_registry import ToolRegistry
 from .tool_settings import ToolSettingsDialog
 from .workspace_view import WorkspaceView
@@ -42,10 +44,12 @@ class Stage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, registry: ToolRegistry, icons: IconManager, config: AppConfig, manager: SessionManager):
+    def __init__(self, registry: ToolRegistry, icons: IconManager, config: AppConfig, manager: SessionManager,
+                 presets: PresetStore | None = None):
         super().__init__()
         self.setWindowTitle("Python Toolbox")
         self.registry, self.icons, self.config, self.manager = registry, icons, config, manager
+        self.presets = presets or PresetStore(config.path.parent / "presets")
         self.resize(1100, 720)
         self.setMinimumSize(520, 420)
 
@@ -57,12 +61,14 @@ class MainWindow(QMainWindow):
         self.stage.pages.addWidget(self.workspace)
         self.drawer = ActiveProcessDrawer(manager, icons, self.stage)
         self.stage.drawer = self.drawer
-        self.queue_drawer = QueueDrawer(manager, registry, icons, self.stage)
+        self.queue_drawer = QueueDrawer(manager, registry, icons, self.stage, self.presets)
         self.stage.queue_drawer = self.queue_drawer
 
         self.library.openRequested.connect(self.open_tool)
         self.library.settingsRequested.connect(self.open_settings)
         self.library.activeRequested.connect(self.drawer.open_drawer)
+        self.library.refreshRequested.connect(self.refresh_tools)
+        self.library.foldersRequested.connect(self.open_tool_folders)
         self.workspace.backRequested.connect(self.show_library)
         self.workspace.queueRequested.connect(self.open_queue)
         self.workspace.currentChanged.connect(self._on_current_session)
@@ -156,6 +162,41 @@ class MainWindow(QMainWindow):
             self.show_library()                      # last tab closed -> back to the library
         else:
             self.workspace.refresh_all()
+
+    # ------------------------------------------------------------------ tool discovery
+    def refresh_tools(self) -> None:
+        """Look for added, removed and changed tools without restarting. Open instances are not touched."""
+        summary = self.registry.scan()
+        self.library.reload()
+        self.workspace.refresh_all()
+        bits = []
+        if summary.added:
+            bits.append(f"{len(summary.added)} new")
+        if summary.removed:
+            bits.append(f"{len(summary.removed)} removed")
+        self.library.show_notice("Refreshed · " + (", ".join(bits) if bits else "no changes"))
+        if self.registry.issues:
+            log.warning("Tool notices:\n%s", "\n".join(self.registry.issues))
+
+    def open_tool_folders(self) -> None:
+        dlg = ToolFoldersDialog(self.registry.tools_dir, self.config.tool_paths, self.icons, self)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new = dlg.paths()
+        finally:
+            dlg.deleteLater()
+        if new == self.config.tool_paths:
+            return
+        old = self.config.tool_paths
+        self.config.tool_paths = new
+        error = self.config.save()
+        if error:
+            self.config.tool_paths = old
+            QMessageBox.warning(self, "Could not save", f"{error}\nThe folder list was not changed.")
+            return
+        self.registry.set_extra_dirs(new)
+        self.refresh_tools()
 
     # ------------------------------------------------------------------ settings
     def open_settings(self, tool_id: str) -> None:

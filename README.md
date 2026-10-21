@@ -37,7 +37,18 @@ PythonToolbox/
         └── main.py
 ```
 
-Tools are discovered **when the toolbox starts** (restart it after adding a folder).
+Tools are discovered at start-up and whenever you press **Refresh** (the circular-arrow button in the library, or
+**F5**): new, removed and edited tools show up without restarting. Open instances are never touched by a refresh
+(an instance of a tool whose folder was deleted keeps its output; running it again reports the missing folder).
+
+**More tool folders.** You do not have to move your tools into `tools/`. The folder button next to Refresh opens
+**Tool folders**: add any number of folders, each holding tool folders (a folder with a `main.py`) exactly like
+`tools/` does. `tools/` is **Path 1** and always stays; added folders are Path 2, 3, ... in the order listed and are
+stored in `config.json` (`"tool_paths": ["D:/MyScripts", ...]`). A folder that is itself a tool is refused (add its
+parent), a folder that disappears is reported and skipped, and a tool reachable through two overlapping folders
+is listed once. If two tools have the same name, both are kept and their cards (and queue pickers, and tab
+labels) carry a small tag naming the path they come from, e.g. `Path 2 · MyScripts`; the tag disappears when the
+clash does. Tools from added folders run in their own folder with their own `.venv`, like any other tool.
 
 ## Framework choice: PySide6 (Qt 6)
 
@@ -132,6 +143,17 @@ the main process has **exited**.
   visible until the cell runs again ("Pending - last run: Completed in 0:03", with its output). While a cell is
   running its configuration is frozen; pending cells stay editable while another one runs. **Stop queue** stops
   the running cell (Ctrl+C, then terminate, then kill; a second press forces it) and cancels the rest.
+* **Choosing a tool.** **+ Tool** opens a searchable list (name, description and folder name; type to filter,
+  Up/Down to move while typing, Enter or double-click to confirm) instead of a dropdown, so it stays usable with
+  hundreds of tools. Tools with the same name show their path.
+* **Presets.** **Save as preset** stores the cells of the queue (code, language, names, tools, predefined
+  answers - never Must Execute, results or output) under a name; **Presets...** lists them with a cell-by-cell
+  preview and **Add to queue** appends the cells to the end of the current queue as if you had added them by hand
+  (so they are fully editable, and importing twice is allowed). Presets are global: any tool's queue can use any
+  preset. Each preset is one readable JSON file in the `presets/` folder next to `config.json`, so they can be
+  copied or shared. Saving over an existing name asks first; presets can be renamed and deleted. A tool cell is
+  saved by its folder name plus the folder it was found in, so presets keep working on another PC where an added
+  folder lives elsewhere; if a tool cannot be found when importing you can **add the cell anyway** or **skip** it.
 * **Predefined answers (paperclip).** `1920, 1080, yes` (whitespace around answers is trimmed; commas cannot be part
   of an answer; an empty entry between commas is an empty line). Answers are typed one per input request, only
   while the process is actually waiting, never all at once. Unused answers are reported; when a cell asks for more
@@ -185,8 +207,8 @@ Scripts run through pipes, not a real console:
 
 ## Configuration
 
-`config.json` (next to `app.py`): `{ "global_python": null }`. `null` = the interpreter running
-the toolbox.
+`config.json` (next to `app.py`): `{ "global_python": null, "tool_paths": [] }`. `null` = the interpreter running
+the toolbox; `tool_paths` = extra folders to look for tools in (managed by the folder button in the library).
 
 ## Tests
 
@@ -196,7 +218,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-217 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+272 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output
@@ -246,6 +268,9 @@ app/
   stdin_watch.py            Toolbox side of input detection (marker folder)
   stdin_probe/              sitecustomize.py injected into queued Python processes - nothing else may live here
   queue_drawer.py           queue drawer: notebook-style cells, insert bars, inline code/output/input, switch
+  queue_dialogs.py          searchable tool picker, save-preset and presets dialogs
+  presets.py                global queue presets (JSON files in presets/) - no Qt
+  tool_folders.py           dialog to add / remove extra tool folders
   gc_guard.py               keeps Python's GC on the GUI thread (see source)
   error_reporting.py        unexpected-error dialog, always shown from the GUI thread
   theme.py                  dark palette and stylesheet

@@ -160,6 +160,48 @@ class StatusPill(QWidget):
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._text)
 
 
+class TagPill(QWidget):
+    """Small muted pill ("Path 2 · MyTools") shown on a card only when another tool has the same name."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        self.setFont(font)
+        self._text = ""
+        self._shown = ""
+        self.setFixedHeight(18)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.setVisible(bool(text))
+        self.fit(10_000)
+
+    def fit(self, max_width: int) -> None:
+        fm = self.fontMetrics()
+        avail = max(24, max_width)
+        self._shown = fm.elidedText(self._text, Qt.TextElideMode.ElideRight, avail - 14)
+        self.setFixedWidth(min(avail, fm.horizontalAdvance(self._shown) + 14))
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        if not self._text:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(theme.BORDER_STRONG), 1))
+        p.setBrush(theme.with_alpha(theme.TEXT_MUTED, 0.10))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        p.setPen(QColor(theme.TEXT_MUTED))
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._shown)
+
+
 class ToolCard(QWidget):
     openRequested = Signal(str)
     settingsRequested = Signal(str)
@@ -189,6 +231,7 @@ class ToolCard(QWidget):
         self._name = ElidedText(1, name_font, theme.TEXT, self)
         self._desc = ElidedText(2, desc_font, theme.TEXT_MUTED, self)
         self._status = StatusPill(self)
+        self._tag = TagPill(self)
 
         self._btn = QToolButton(self)
         self._btn.setObjectName("Flat")
@@ -210,6 +253,8 @@ class ToolCard(QWidget):
         self._name.set_text(m.name)
         self._desc.set_text(m.description)
         self._desc.setVisible(bool(m.description))
+        self._tag.set_text(self.tool.tag)
+        self._place_tag()
         self.setToolTip(f"{m.name}\n{self.tool.path}")
         self.setAccessibleName(m.name)
         self.setAccessibleDescription(m.description)
@@ -217,10 +262,22 @@ class ToolCard(QWidget):
 
     def set_status(self, kind: str | None, count: int = 0) -> None:
         self._status.set_status(kind, count)
+        self._place_tag()
 
     @property
     def status_kind(self) -> str | None:
         return self._status.kind
+
+    def _place_tag(self) -> None:
+        """Bottom-right, in whatever room the status pill leaves."""
+        if self._tag.isHidden() and not self._tag.text:
+            return
+        w = self.width()
+        body_x, body_y, body_w = GLOW, GLOW, w - 2 * GLOW
+        left = body_x + 14 + IconTile.SIZE + 12
+        room = body_x + body_w - 14 - left - (self._status.width() + 8 if not self._status.isHidden() else 0)
+        self._tag.fit(room)
+        self._tag.move(body_x + body_w - 14 - self._tag.width(), body_y + CARD_BODY_H - 14 - self._tag.height())
 
     # -- geometry --------------------------------------------------------------
     def resizeEvent(self, _event) -> None:
@@ -232,6 +289,7 @@ class ToolCard(QWidget):
         self._name.setGeometry(left, body_y + 14, max(10, self._btn.x() - 6 - left), self._name.height())
         self._desc.setGeometry(left, body_y + 38, max(10, body_x + body_w - 14 - left), self._desc.height())
         self._status.move(left, body_y + CARD_BODY_H - 14 - self._status.height())
+        self._place_tag()
 
     # -- painting ----------------------------------------------------------------
     def _set_hover(self, value: float) -> None:

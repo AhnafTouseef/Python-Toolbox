@@ -237,6 +237,21 @@ class SessionQueue(QObject):
         self.structureChanged.emit()
         return cell
 
+    def add_cells(self, specs: list[dict]) -> list[QueueCell]:
+        """Append several cells at once (a preset): exactly as if they were added one by one, announced once."""
+        added = []
+        for spec in specs:
+            lang = spec.get("language", LANG_PYTHON)
+            cell = QueueCell(kind=spec["kind"], label=spec.get("label", "").strip(), command=spec.get("command", ""),
+                             tool_id=spec.get("tool_id", ""), answers_text=spec.get("answers_text", ""),
+                             language=lang if lang in (LANG_PYTHON, LANG_SHELL) else LANG_PYTHON)
+            self.cells.append(cell)
+            added.append(cell)
+        if added:
+            self._refresh_idle_state()
+            self.structureChanged.emit()
+        return added
+
     def update_cell(self, cell_id: str, **fields) -> bool:
         """Change a pending cell. Once a cell has started its configuration is frozen (returns False)."""
         cell = self.cell(cell_id)

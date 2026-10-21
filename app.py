@@ -33,7 +33,7 @@ def main() -> int:
 
     config = AppConfig.load(ROOT / "config.json")
     icons = IconManager(ROOT / "assets" / "icons", ROOT / "assets" / "lucide-tags.json")
-    registry = ToolRegistry(ROOT / "tools", icons)
+    registry = ToolRegistry(ROOT / "tools", icons, config.tool_paths)
     registry.scan()
     manager = SessionManager(registry, config)
 

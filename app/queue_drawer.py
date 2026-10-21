@@ -29,6 +29,8 @@ from .session_manager import Session, SessionManager
 from .session_queue import SessionQueue
 from .slide_drawer import SlideDrawer, drawer_width
 from .terminal_view import TerminalView
+from .presets import PresetStore, cell_to_preset
+from .queue_dialogs import PresetsDialog, SavePresetDialog, ToolCellDialog
 from .tool_registry import ToolRegistry
 
 CELL_COLORS = {
@@ -597,73 +599,13 @@ class CellCard(QFrame):
         self._prev_status = c.status
 
 
-# =============================================================================== tool picker
-class ToolCellDialog(QDialog):
-    """Choose the tool of a tool cell (and, optionally, a name). Answers are edited on the cell itself."""
-
-    def __init__(self, registry: ToolRegistry, icons: IconManager, cell: QueueCell | None = None,
-                 parent: QWidget | None = None):
-        super().__init__(parent)
-        self._registry = registry
-        editing = cell is not None
-        self.setWindowTitle("Edit tool cell" if editing else "Add tool cell")
-        self.setMinimumWidth(440)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 16, 18, 16)
-        lay.setSpacing(8)
-
-        self.tool_combo = QComboBox()
-        self.tool_info = QLabel()
-        for t in sorted(registry.tools, key=lambda t: t.meta.name.casefold()):
-            self.tool_combo.addItem(icons.icon(t.meta.icon, t.meta.color, 16), t.meta.name, t.id)
-        if cell and cell.tool_id and self.tool_combo.findData(cell.tool_id) < 0:
-            self.tool_combo.addItem(f"{cell.tool_id} (not available)", cell.tool_id)
-        if cell and cell.tool_id:
-            self.tool_combo.setCurrentIndex(max(0, self.tool_combo.findData(cell.tool_id)))
-        self.tool_combo.setAccessibleName("Tool")
-        self.tool_info.setWordWrap(True)
-        self.tool_info.setObjectName("Muted")
-        hint = QLabel("Launched exactly like the Run button does: the tool's own .venv interpreter if it has one, "
-                      "otherwise the global Python.")
-        hint.setWordWrap(True)
-        hint.setObjectName("Muted")
-        self.name = QLineEdit(cell.label if cell else "")
-        self.name.setPlaceholderText("Optional — shown instead of the tool's name")
-        self.name.setAccessibleName("Cell name")
-        lay.addWidget(QLabel("Tool"))
-        lay.addWidget(self.tool_combo)
-        lay.addWidget(self.tool_info)
-        lay.addWidget(hint)
-        lay.addSpacing(4)
-        lay.addWidget(QLabel("Name (optional)"))
-        lay.addWidget(self.name)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
-        self.ok.setText("Save" if editing else "Add")
-        self.ok.setObjectName("Primary")
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        lay.addSpacing(6)
-        lay.addWidget(self.buttons)
-        self.tool_combo.currentIndexChanged.connect(self._tool_changed)
-        self._tool_changed()
-
-    def _tool_changed(self) -> None:
-        tool = self._registry.get(self.tool_combo.currentData() or "")
-        self.tool_info.setText(tool.meta.description.strip() if tool is not None and tool.meta.description.strip()
-                               else ("No description." if tool is not None else "This tool is not available."))
-        self.ok.setEnabled(tool is not None)
-
-    def values(self) -> dict:
-        return {"label": self.name.text().strip(), "tool_id": self.tool_combo.currentData() or ""}
-
-
 # =============================================================================== the drawer
 class QueueDrawer(SlideDrawer):
-    def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager, parent: QWidget):
+    def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager, parent: QWidget,
+                 presets: PresetStore | None = None):
         super().__init__(parent)
         self._manager, self._registry, self._icons = manager, registry, icons
+        self._presets = presets
         self.session: Session | None = None
         self.queue: SessionQueue | None = None
         self._expanded: dict[str, set[str]] = {}          # session id -> cells whose paperclip area is open
@@ -759,6 +701,26 @@ class QueueDrawer(SlideDrawer):
         ml.addLayout(row)
         ml.addWidget(self.must_note)
         lay.addWidget(box)
+
+        # presets: save this queue for later / add a saved one
+        prow = QHBoxLayout()
+        prow.setSpacing(8)
+        self.save_preset_button = QPushButton(" Save as preset")
+        self.save_preset_button.setIcon(self._icons.icon("save", theme.TEXT, 15))
+        self.save_preset_button.setFixedHeight(28)
+        self.save_preset_button.setToolTip("Save the cells of this queue as a preset, to add to any queue later")
+        self.save_preset_button.setAccessibleName("Save queue as preset")
+        self.import_preset_button = QPushButton(" Presets…")
+        self.import_preset_button.setIcon(self._icons.icon("bookmark", theme.TEXT, 15))
+        self.import_preset_button.setFixedHeight(28)
+        self.import_preset_button.setToolTip("Add the cells of a saved preset to the end of this queue")
+        self.import_preset_button.setAccessibleName("Import preset")
+        self.save_preset_button.clicked.connect(self.save_preset)
+        self.import_preset_button.clicked.connect(self.import_preset)
+        prow.addWidget(self.save_preset_button)
+        prow.addWidget(self.import_preset_button)
+        prow.addStretch(1)
+        lay.addLayout(prow)
 
         # the cells: [bar] card [bar] card ... [always-open bar]
         self._list = QVBoxLayout()
@@ -895,6 +857,7 @@ class QueueDrawer(SlideDrawer):
         self.state_label.setText(f"<span style='color:{color}'>●</span>&nbsp; {q.state_text}")
         self.banner.setStyleSheet(f"#Banner {{ background: {rgba(color, 0.10)}; border: 1px solid {rgba(color, 0.35)};"
                                   f" border-radius: 10px; }}")
+        self.save_preset_button.setEnabled(bool(q.cells))
         self.stop_button.setVisible(q.executing)
         self.stop_button.setText(" Force stop" if q.stopping else " Stop queue")
         self.stop_button.setToolTip("Stop the running cell and cancel the cells that have not started"
@@ -1019,6 +982,40 @@ class QueueDrawer(SlideDrawer):
             return dlg.exec() == QDialog.DialogCode.Accepted
         finally:
             dlg.deleteLater()
+
+    @property
+    def presets(self) -> PresetStore | None:
+        return self._presets
+
+    def save_preset(self) -> None:
+        """Save the cells of this queue (configuration only) as a global preset."""
+        if self.queue is None or self._presets is None or not self.queue.cells:
+            return
+        cells = [cell_to_preset(c, self._registry) for c in self.queue.cells]
+        dlg = SavePresetDialog(self._presets, len(cells), self)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            error = self._presets.save(dlg.preset_name(), cells, overwrite=dlg.overwrite)
+        finally:
+            dlg.deleteLater()
+        if error:
+            QMessageBox.warning(self, "Preset not saved", error)
+
+    def import_preset(self) -> None:
+        """Choose a preset; its cells are appended to this queue like manually added ones."""
+        if self.queue is None or self._presets is None:
+            return
+        dlg = PresetsDialog(self._presets, self._registry, self._icons, self)
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            specs = dlg.result_specs
+        finally:
+            dlg.deleteLater()
+        added = self.queue.add_cells(specs)
+        if added and added[0].id in self._cards:
+            self.scroll.ensureWidgetVisible(self._cards[added[0].id])
 
     def remove_cell(self, cell: QueueCell) -> None:
         if self.queue is not None:

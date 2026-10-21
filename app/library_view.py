@@ -26,10 +26,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QObject, QRect, QTimer, Qt, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
-                               QScrollArea, QVBoxLayout, QWidget)
+                               QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from . import theme
 from .icon_manager import IconManager
@@ -143,6 +143,8 @@ class LibraryView(QWidget):
     openRequested = Signal(str)
     settingsRequested = Signal(str)
     activeRequested = Signal()
+    refreshRequested = Signal()
+    foldersRequested = Signal()
 
     def __init__(self, registry: ToolRegistry, icons: IconManager, status_provider: StatusProvider,
                  parent: QWidget | None = None):
@@ -190,10 +192,37 @@ class LibraryView(QWidget):
         self._active_btn.setIcon(icons.icon("activity", theme.TEXT, 16))
         self._active_btn.setToolTip("Show running processes")
         self._active_btn.setAccessibleName("Active processes")
+        self._notice = QLabel()
+        self._notice.setStyleSheet(f"color: {theme.INFO}; font-size: 12px;")
+        self._notice.setAccessibleName("Refresh result")
+        self._notice.hide()
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.setInterval(6000)
+        self._notice_timer.timeout.connect(self._notice.hide)
+        self._refresh_btn = QToolButton()
+        self._refresh_btn.setObjectName("Flat")
+        self._refresh_btn.setIcon(icons.icon("refresh-cw", theme.TEXT, 18))
+        self._refresh_btn.setIconSize(QSize(18, 18))
+        self._refresh_btn.setFixedSize(32, 32)
+        self._refresh_btn.setToolTip("Refresh: look for added, removed or changed tools (F5)")
+        self._refresh_btn.setAccessibleName("Refresh tools")
+        self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._folders_btn = QToolButton()
+        self._folders_btn.setObjectName("Flat")
+        self._folders_btn.setIcon(icons.icon("folder-open", theme.TEXT, 18))
+        self._folders_btn.setIconSize(QSize(18, 18))
+        self._folders_btn.setFixedSize(32, 32)
+        self._folders_btn.setToolTip("Tool folders: add more places to look for tools")
+        self._folders_btn.setAccessibleName("Tool folders")
+        self._folders_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         hl.addWidget(title)
         hl.addWidget(self._count)
+        hl.addWidget(self._notice)
         hl.addStretch(1)
         hl.addWidget(self._search, 2)
+        hl.addWidget(self._refresh_btn)
+        hl.addWidget(self._folders_btn)
         hl.addWidget(self._active_btn)
 
         self._banner = IssueBanner()
@@ -233,6 +262,9 @@ class LibraryView(QWidget):
         self._sb.valueChanged.connect(self._on_scroll)             # scroll => scheduling only
         self._search.textChanged.connect(self._on_search)
         self._active_btn.clicked.connect(self.activeRequested)
+        self._refresh_btn.clicked.connect(self.refreshRequested)
+        self._folders_btn.clicked.connect(self.foldersRequested)
+        QShortcut(QKeySequence(Qt.Key.Key_F5), self, self.refreshRequested.emit)
         self._registry.metadataChanged.connect(self._on_metadata_changed)
 
         self.reload()
@@ -245,6 +277,13 @@ class LibraryView(QWidget):
         for tid in [t for t in self._slots if t not in known]:
             self._drop_slot(tid)
         self._apply_filter(self._filter, reset_scroll=False)
+
+    def show_notice(self, text: str) -> None:
+        """A short message next to the tool count (e.g. the result of a refresh); it fades after a few seconds."""
+        self._notice.setText(text)
+        self._notice.setVisible(bool(text))
+        if text:
+            self._notice_timer.start()
 
     def set_active_count(self, n: int) -> None:
         self._active_btn.setText(" Active" if n == 0 else f" Active · {n}")
@@ -300,7 +339,7 @@ class LibraryView(QWidget):
             if tid not in self._item_index and not w.isHidden():
                 w.hide()
         if not items:
-            self._empty.setText("No tools found.\nAdd a folder with a main.py to the tools directory."
+            self._empty.setText("No tools found.\nAdd a folder with a main.py to the tools directory (or add another place with the folder button), then press Refresh."
                                 if not self._registry.tools else f"No tools match “{text}”.")
         self._empty.setVisible(not items)
         self._position_empty()
