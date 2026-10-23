@@ -2,12 +2,13 @@
 
 config.json lives next to app.py:
 
-    { "global_python": null, "tool_paths": [] }
+    { "global_python": null, "tool_paths": [], "pinned": [], "notifications": true }
 
 `null` means "use the interpreter that is running the toolbox". Set it to the full
 path of a python.exe to use a different global interpreter for tools without a .venv.
 `tool_paths` lists extra folders to look for tools in (each holds tool folders, like tools/ does);
-the application's own tools/ folder is always searched first.
+the application's own tools/ folder is always searched first.  `pinned` lists the tools pinned to the top of the
+library (their ids: the folder name for tools/, the full folder path for tools of added folders).
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ class AppConfig:
     path: Path
     global_python: str | None = None
     tool_paths: list[str] = field(default_factory=list)
+    pinned: list[str] = field(default_factory=list)
+    notifications: bool = True
     notice: str | None = None  # set when the file was unreadable/invalid
     _other: dict = field(default_factory=dict, repr=False)      # unknown keys, written back untouched
 
@@ -44,6 +47,8 @@ class AppConfig:
         data = dict(self._other)
         data["global_python"] = self.global_python
         data["tool_paths"] = list(self.tool_paths)
+        data["pinned"] = list(self.pinned)
+        data["notifications"] = self.notifications
         return data
 
     def save(self) -> str | None:
@@ -66,7 +71,7 @@ class AppConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("expected a JSON object")
-            cfg._other = {k: v for k, v in data.items() if k not in ("global_python", "tool_paths")}
+            cfg._other = {k: v for k, v in data.items() if k not in ("global_python", "tool_paths", "pinned", "notifications")}
             value = data.get("global_python")
             if value is None or (isinstance(value, str) and not value.strip()):
                 cfg.global_python = None
@@ -88,6 +93,15 @@ class AppConfig:
                 if key not in seen:
                     seen.add(key)
                     cfg.tool_paths.append(entry.strip())
+            if isinstance(data.get("notifications"), bool):
+                cfg.notifications = data["notifications"]
+            pins = data.get("pinned", [])
+            if isinstance(pins, list):
+                for entry in pins:
+                    if isinstance(entry, str) and entry.strip() and entry not in cfg.pinned:
+                        cfg.pinned.append(entry)
+            elif pins is not None:
+                cfg.notice = "config.json: 'pinned' must be a list; ignored."
         except (OSError, ValueError) as exc:
             cfg.notice = f"config.json could not be used ({exc}); falling back to the interpreter running the toolbox."
             log.warning(cfg.notice)

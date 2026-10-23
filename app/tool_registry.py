@@ -31,6 +31,7 @@ class ToolInfo:
     root: Path | None = None      # the folder that was scanned to find it (tools/ or an added folder)
     root_index: int = 0           # 0 = the built-in tools/ folder ("Path 1"), then the added folders in order
     tag: str = ""                 # "Path 2 · MyTools" - only set while another tool has the same name
+    pinned: bool = False          # pinned tools are listed first in the library
 
     @property
     def entry(self) -> Path:
@@ -77,7 +78,7 @@ class ToolRegistry(QObject):
     metadataChanged = Signal(str)          # tool id
 
     def __init__(self, tools_dir: Path, icons: IconManager, extra_dirs: list[Path] | list[str] | tuple = (),
-                 parent: QObject | None = None):
+                 parent: QObject | None = None, pinned: list[str] | tuple = ()):
         super().__init__(parent)
         self.tools_dir = Path(tools_dir)
         self.extra_dirs: list[Path] = [Path(d) for d in extra_dirs]
@@ -85,6 +86,17 @@ class ToolRegistry(QObject):
         self.tools: list[ToolInfo] = []
         self.by_id: dict[str, ToolInfo] = {}
         self.issues: list[str] = []
+        self.pinned_ids: list[str] = list(pinned)
+
+    # ------------------------------------------------------------------ pinning
+    def set_pinned(self, ids) -> None:
+        self.pinned_ids = list(dict.fromkeys(ids))
+        wanted = set(self.pinned_ids)
+        for t in self.tools:
+            t.pinned = t.id in wanted
+
+    def is_pinned(self, tool_id: str) -> bool:
+        return tool_id in self.pinned_ids
 
     # ------------------------------------------------------------------ folders
     @property
@@ -148,6 +160,7 @@ class ToolRegistry(QObject):
         self.tools = tools
         self.by_id = {t.id: t for t in tools}
         self.issues = issues
+        self.set_pinned(self.pinned_ids)
         tag_changes = self._recompute_tags()
         for tid in dict.fromkeys(changed + tag_changes):
             if tid in self.by_id and tid not in summary.added:

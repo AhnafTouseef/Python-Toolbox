@@ -79,6 +79,7 @@ class WorkspaceView(QWidget):
     quickCloseRequested = Signal(object)   # Session: the user double-clicked a tab (stops and closes, no question)
     currentChanged = Signal(object)        # Session or None
     queueRequested = Signal()              # the Queue button: open the current session's queue drawer
+    editRequested = Signal(object)         # the edit button: open the current tool's main.py in the editor
 
     def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager,
                  parent: QWidget | None = None):
@@ -137,6 +138,13 @@ class WorkspaceView(QWidget):
         self.status = QLabel()
         self.status.setMinimumWidth(40)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.edit_button = QToolButton()
+        self.edit_button.setObjectName("Flat")
+        self.edit_button.setIcon(icons.icon("square-pen", theme.TEXT, 18))
+        self.edit_button.setIconSize(QSize(18, 18))
+        self.edit_button.setFixedSize(32, 32)
+        self.edit_button.setToolTip("Open this tool's main.py in your editor")
+        self.edit_button.setAccessibleName("Open in editor")
         self.queue_button = QPushButton(" Queue")
         self.queue_button.setIcon(icons.icon("list-checks", theme.TEXT, 16))
         self.queue_button.setAccessibleName("Open the queue")
@@ -147,6 +155,7 @@ class WorkspaceView(QWidget):
         bl.addWidget(self.tile)
         bl.addWidget(self.title, 3)
         bl.addWidget(self.status, 2)
+        bl.addWidget(self.edit_button)
         bl.addWidget(self.queue_button)
         bl.addWidget(self.run_button)
 
@@ -167,6 +176,7 @@ class WorkspaceView(QWidget):
         self.plus_button.clicked.connect(self.newInstanceRequested)
         self.run_button.clicked.connect(self._run_or_stop)
         self.queue_button.clicked.connect(self.queueRequested)
+        self.edit_button.clicked.connect(lambda: self.editRequested.emit(self.current_session()))
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBarDoubleClicked.connect(self._tab_double_clicked)
         manager.sessionAdded.connect(self.add_session)
@@ -294,6 +304,7 @@ class WorkspaceView(QWidget):
         self.run_button.setEnabled(s is not None and not (s.queue.busy and not s.is_running))
         self.plus_button.setEnabled(s is not None)
         self.queue_button.setEnabled(s is not None)
+        self.edit_button.setEnabled(s is not None)
         if s is None:
             self.queue_button.setText(" Queue")
             self.title.setText("")

@@ -144,6 +144,8 @@ class LibraryView(QWidget):
     settingsRequested = Signal(str)
     activeRequested = Signal()
     refreshRequested = Signal()
+    pinRequested = Signal(str)
+    editRequested = Signal(str)
     foldersRequested = Signal()
 
     def __init__(self, registry: ToolRegistry, icons: IconManager, status_provider: StatusProvider,
@@ -313,6 +315,12 @@ class LibraryView(QWidget):
         if card is not None:
             card.apply_metadata()
 
+    def refresh_pins(self) -> None:
+        """A tool was pinned / unpinned: pinned ones move to the front and every card shows its state."""
+        for card in self._cards.values():
+            card.apply_pin()
+        self._apply_filter(self._filter, reset_scroll=False)
+
     # --------------------------------------------------------------- filtering
     def _on_search(self, text: str) -> None:
         self._apply_filter(text, reset_scroll=True)
@@ -329,6 +337,7 @@ class LibraryView(QWidget):
                     items.append(t)
         else:
             items = list(self._registry.tools)
+        items.sort(key=lambda t: not t.pinned)              # pinned tools first (stable: the order inside is unchanged)
         self._items = items
         self._item_index = {t.id: i for i, t in enumerate(items)}
         total = len(self._registry.tools)
@@ -506,6 +515,8 @@ class LibraryView(QWidget):
             card = self.card_factory(tool)
             card.openRequested.connect(self.openRequested)
             card.settingsRequested.connect(self.settingsRequested)
+            card.pinRequested.connect(self.pinRequested)
+            card.editRequested.connect(self.editRequested)
             card.navigateRequested.connect(self._on_navigate)
             kind, count = self._status_provider(tid)
             card.set_status(kind, count)

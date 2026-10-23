@@ -205,6 +205,8 @@ class TagPill(QWidget):
 class ToolCard(QWidget):
     openRequested = Signal(str)
     settingsRequested = Signal(str)
+    pinRequested = Signal(str)
+    editRequested = Signal(str)
     navigateRequested = Signal(str, int)     # tool id, Qt.Key
 
     def __init__(self, tool: ToolInfo, icons: IconManager, parent: QWidget | None = None):
@@ -244,6 +246,14 @@ class ToolCard(QWidget):
         self._btn.clicked.connect(lambda: self.settingsRequested.emit(self.tool.id))
         self._btn.setIcon(icons.icon("settings", theme.TEXT_MUTED, 16))
 
+        self._pin = QToolButton(self)
+        self._pin.setObjectName("Flat")
+        self._pin.setFixedSize(28, 28)
+        self._pin.setIconSize(QSize(16, 16))
+        self._pin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pin.setCursor(Qt.CursorShape.ArrowCursor)
+        self._pin.clicked.connect(lambda: self.pinRequested.emit(self.tool.id))
+
         self.apply_metadata()
 
     # -- data ----------------------------------------------------------------
@@ -255,10 +265,19 @@ class ToolCard(QWidget):
         self._desc.setVisible(bool(m.description))
         self._tag.set_text(self.tool.tag)
         self._place_tag()
+        self.apply_pin()
         self.setToolTip(f"{m.name}\n{self.tool.path}")
         self.setAccessibleName(m.name)
         self.setAccessibleDescription(m.description)
         self.update()
+
+    def apply_pin(self) -> None:
+        """The pin shows while the tool is pinned, and on hover (to pin it)."""
+        pinned = self.tool.pinned
+        self._pin.setIcon(self._icons.icon("pin", theme.INFO if pinned else theme.TEXT_MUTED, 16))
+        self._pin.setToolTip("Unpin from the top" if pinned else "Pin to the top of the library")
+        self._pin.setAccessibleName("Unpin tool" if pinned else "Pin tool")
+        self._pin.setVisible(pinned or self.underMouse())
 
     def set_status(self, kind: str | None, count: int = 0) -> None:
         self._status.set_status(kind, count)
@@ -285,8 +304,9 @@ class ToolCard(QWidget):
         body_x, body_y, body_w = GLOW, GLOW, w - 2 * GLOW
         self._tile.move(body_x + 14, body_y + 14)
         self._btn.move(body_x + body_w - 10 - 28, body_y + 8)
+        self._pin.move(self._btn.x() - 26, body_y + 8)
         left = body_x + 14 + IconTile.SIZE + 12
-        self._name.setGeometry(left, body_y + 14, max(10, self._btn.x() - 6 - left), self._name.height())
+        self._name.setGeometry(left, body_y + 14, max(10, self._pin.x() - 4 - left), self._name.height())
         self._desc.setGeometry(left, body_y + 38, max(10, body_x + body_w - 14 - left), self._desc.height())
         self._status.move(left, body_y + CARD_BODY_H - 14 - self._status.height())
         self._place_tag()
@@ -329,11 +349,13 @@ class ToolCard(QWidget):
 
     def enterEvent(self, event) -> None:
         self._animate_to(1.0)
+        self._pin.show()
         self._btn.setIcon(self._icons.icon("settings", theme.TEXT, 16))
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._animate_to(0.0)
+        self._pin.setVisible(self.tool.pinned)
         self._btn.setIcon(self._icons.icon("settings", theme.TEXT_MUTED, 16))
         self._pressed = False
         super().leaveEvent(event)
@@ -380,6 +402,9 @@ class ToolCard(QWidget):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         menu.addAction("Open", lambda: self.openRequested.emit(self.tool.id))
+        menu.addAction("Unpin from the top" if self.tool.pinned else "Pin to the top",
+                       lambda: self.pinRequested.emit(self.tool.id))
+        menu.addAction("Open main.py in editor", lambda: self.editRequested.emit(self.tool.id))
         menu.addAction("Settings…", lambda: self.settingsRequested.emit(self.tool.id))
         menu.exec(event.globalPos())
 

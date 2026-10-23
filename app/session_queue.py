@@ -132,6 +132,7 @@ class SessionQueue(QObject):
         self._run: _Run | None = None
         self._user_stop = False
         self._advance_pending = False
+        self._scope: set[str] | None = None        # ids of the cells of a manual run (None: every pending cell)
         self.discarded = False
         self._poll = QTimer(self)
         self._poll.setInterval(self.poll_ms)
@@ -169,6 +170,11 @@ class SessionQueue(QObject):
     def tool_name(self, cell: QueueCell) -> str | None:
         tool = self.tool_of(cell)
         return tool.meta.name if tool is not None else None
+
+    @property
+    def can_start(self) -> bool:
+        """A run can be started by hand: nothing of this instance is running and there is something to run."""
+        return (not self.discarded and not self.busy and not self.session.is_active and bool(self.pending_cells()))
 
     def can_move(self, cell: QueueCell, delta: int) -> bool:
         if not cell.is_pending or cell not in self.cells:
@@ -220,8 +226,8 @@ class SessionQueue(QObject):
     def _on_session_status(self, _session) -> None:
         if self.state in (QueueState.NOT_RUN, QueueState.COMPLETED, QueueState.STOPPED) and self.session.is_running:
             self._refresh_idle_state()
-        elif self.state is QueueState.WAITING:
-            self.stateChanged.emit()                             # wording depends on "main is running"
+        else:
+            self.stateChanged.emit()                             # wording / "can run now" depend on the main process
 
     # ------------------------------------------------------------------ editing (GUI actions)
     def add_cell(self, kind: CellKind, *, label: str = "", command: str = "", tool_id: str = "",
@@ -251,6 +257,18 @@ class SessionQueue(QObject):
             self._refresh_idle_state()
             self.structureChanged.emit()
         return added
+
+    def duplicate_cell(self, cell_id: str) -> QueueCell | None:
+        """A copy of the cell's configuration (never its results or output), inserted right below it."""
+        src = self.cell(cell_id)
+        if src is None:
+            return None
+        copy = QueueCell(kind=src.kind, label=src.label, command=src.command, language=src.language,
+                         tool_id=src.tool_id, answers_text=src.answers_text)
+        self.cells.insert(self.cells.index(src) + 1, copy)
+        self._refresh_idle_state()
+        self.structureChanged.emit()
+        return copy
 
     def update_cell(self, cell_id: str, **fields) -> bool:
         """Change a pending cell. Once a cell has started its configuration is frozen (returns False)."""
@@ -306,10 +324,39 @@ class SessionQueue(QObject):
             self._set_state(QueueState.NOT_RUN,
                             f"Not run — the main process {why} and Must Execute is off. The cells are kept.")
 
-    def _begin(self) -> None:
+    def _begin(self, scope: set[str] | None = None) -> None:
         self._user_stop = False
+        self._scope = scope
         self._set_state(QueueState.EXECUTING)
         self._schedule_advance()
+
+    # ------------------------------------------------------------------ starting by hand
+    def run_now(self) -> bool:
+        """Run every pending cell now, without waiting for the main process (which is not running)."""
+        if not self.can_start:
+            return False
+        self._begin()
+        return True
+
+    def run_cell(self, cell_id: str) -> bool:
+        """Run only this cell, now."""
+        cell = self.cell(cell_id)
+        if cell is None or not cell.is_pending or not self.can_start:
+            return False
+        self._begin({cell.id})
+        return True
+
+    def run_from(self, cell_id: str) -> bool:
+        """Run this cell and every pending cell below it, now."""
+        cell = self.cell(cell_id)
+        if cell is None or not cell.is_pending or not self.can_start:
+            return False
+        i = self.cells.index(cell)
+        self._begin({c.id for c in self.cells[i:] if c.is_pending})
+        return True
+
+    def _in_scope(self, cell: QueueCell) -> bool:
+        return cell.is_pending and (self._scope is None or cell.id in self._scope)
 
     # ------------------------------------------------------------------ the sequential loop
     def _schedule_advance(self) -> None:
@@ -327,7 +374,7 @@ class SessionQueue(QObject):
             self._mark_rest(CellStatus.CANCELLED, "queue stopped by you")
             self._finish(QueueState.STOPPED, "Stopped by you")
             return
-        cell = next((c for c in self.cells if c.is_pending), None)
+        cell = next((c for c in self.cells if self._in_scope(c)), None)
         if cell is None:
             failed = sum(1 for c in self.cells if c.status in (CellStatus.FAILED, CellStatus.CANCELLED))
             self._finish(QueueState.COMPLETED,
@@ -338,13 +385,14 @@ class SessionQueue(QObject):
     def _finish(self, state: QueueState, detail: str) -> None:
         for c in self.cells:
             c.rearm()                                            # editable again; the result stays readable
+        self._scope = None
         self._set_state(state, detail)
         self.structureChanged.emit()
         self.settled.emit()
 
     def _mark_rest(self, status: CellStatus, reason: str) -> None:
         for c in self.cells:
-            if c.is_pending:
+            if self._in_scope(c):
                 c.status, c.reason = status, reason
                 c.finished_at = datetime.now()
                 self.cellChanged.emit(c)
@@ -587,6 +635,11 @@ class SessionQueue(QObject):
             self._system(run.cell, "■ Stop requested (Ctrl+C sent)…")
             run.runner.request_stop()
         self.stateChanged.emit()
+
+    @property
+    def user_stopped(self) -> bool:
+        """The last run was ended by the user (Stop), not by a failure or by finishing."""
+        return self._user_stop
 
     @property
     def stopping(self) -> bool:

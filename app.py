@@ -21,6 +21,7 @@ from app.icon_manager import IconManager  # noqa: E402
 from app.main_window import MainWindow  # noqa: E402
 from app.session_manager import SessionManager  # noqa: E402
 from app.tool_registry import ToolRegistry  # noqa: E402
+from app.tray import TrayController  # noqa: E402
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -33,11 +34,13 @@ def main() -> int:
 
     config = AppConfig.load(ROOT / "config.json")
     icons = IconManager(ROOT / "assets" / "icons", ROOT / "assets" / "lucide-tags.json")
-    registry = ToolRegistry(ROOT / "tools", icons, config.tool_paths)
+    registry = ToolRegistry(ROOT / "tools", icons, config.tool_paths, pinned=config.pinned)
     registry.scan()
     manager = SessionManager(registry, config)
 
-    window = MainWindow(registry, icons, config, manager)
+    tray = TrayController(icons, config, manager)            # the close button sends the window here (if a tray exists)
+    app.setQuitOnLastWindowClosed(not tray.available)
+    window = MainWindow(registry, icons, config, manager, tray=tray if tray.available else None)
     window.show()
     return app.exec()
 

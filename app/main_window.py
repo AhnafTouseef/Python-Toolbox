@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QRect, QTimer, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QDialog, QMainWindow, QMessageBox, QStackedWidget, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMessageBox, QStackedWidget, QWidget
 
 from . import theme
 from .active_process_drawer import ActiveProcessDrawer
@@ -15,6 +15,7 @@ from .icon_manager import IconManager
 from .library_view import LibraryView
 from .queue_drawer import QueueDrawer
 from .session_manager import Session, SessionManager
+from .editor import open_in_editor
 from .presets import PresetStore
 from .tool_folders import ToolFoldersDialog
 from .tool_registry import ToolRegistry
@@ -45,11 +46,14 @@ class Stage(QWidget):
 
 class MainWindow(QMainWindow):
     def __init__(self, registry: ToolRegistry, icons: IconManager, config: AppConfig, manager: SessionManager,
-                 presets: PresetStore | None = None):
+                 presets: PresetStore | None = None, tray=None):
         super().__init__()
         self.setWindowTitle("Python Toolbox")
         self.registry, self.icons, self.config, self.manager = registry, icons, config, manager
         self.presets = presets or PresetStore(config.path.parent / "presets")
+        self.tray = tray
+        self._quitting = False
+        self._hinted = False
         self.resize(1100, 720)
         self.setMinimumSize(520, 420)
 
@@ -66,6 +70,9 @@ class MainWindow(QMainWindow):
 
         self.library.openRequested.connect(self.open_tool)
         self.library.settingsRequested.connect(self.open_settings)
+        self.library.pinRequested.connect(self.toggle_pin)
+        self.library.editRequested.connect(self.edit_tool)
+        self.workspace.editRequested.connect(lambda sess: sess is not None and self.edit_tool(sess.tool_id))
         self.library.activeRequested.connect(self.drawer.open_drawer)
         self.library.refreshRequested.connect(self.refresh_tools)
         self.library.foldersRequested.connect(self.open_tool_folders)
@@ -87,6 +94,12 @@ class MainWindow(QMainWindow):
             log.warning("Tool notices:\n%s", "\n".join(registry.issues))
         if config.notice:
             log.warning(config.notice)
+        if tray is not None:
+            self.setWindowIcon(tray.icon)
+            tray.window_in_front = lambda: self.isVisible() and not self.isMinimized() and self.isActiveWindow()
+            tray.showRequested.connect(self.show_from_tray)
+            tray.quitRequested.connect(self.quit_app)
+            tray.sessionRequested.connect(self._show_session_from_tray)
 
     # ------------------------------------------------------------------ navigation
     def show_library(self) -> None:
@@ -198,6 +211,31 @@ class MainWindow(QMainWindow):
         self.registry.set_extra_dirs(new)
         self.refresh_tools()
 
+    # ------------------------------------------------------------------ pinning / editor
+    def toggle_pin(self, tool_id: str) -> None:
+        """Pin a tool to the top of the library (or unpin it). Stored in config.json."""
+        if self.registry.get(tool_id) is None:
+            return
+        old = list(self.config.pinned)
+        pins = [t for t in old if t != tool_id] if tool_id in old else [*old, tool_id]
+        self.config.pinned = pins
+        error = self.config.save()
+        if error:
+            self.config.pinned = old
+            QMessageBox.warning(self, "Could not save", f"{error}\nThe pin was not changed.")
+            return
+        self.registry.set_pinned(pins)
+        self.library.refresh_pins()
+
+    def edit_tool(self, tool_id: str) -> None:
+        """Open the tool's main.py in the system's editor (see editor.py for how each OS does it)."""
+        tool = self.registry.get(tool_id)
+        if tool is None:
+            return
+        error = open_in_editor(tool.entry)
+        if error:
+            QMessageBox.warning(self, "Could not open the editor", error)
+
     # ------------------------------------------------------------------ settings
     def open_settings(self, tool_id: str) -> None:
         tool = self.registry.get(tool_id)
@@ -232,9 +270,35 @@ class MainWindow(QMainWindow):
         return box.clickedButton() is quit_btn
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.tray is not None and self.tray.available and not self._quitting:
+            event.ignore()                           # the X sends the window to the tray; everything keeps running
+            self.hide()
+            if not self._hinted:
+                self._hinted = True
+                self.tray.hint_hidden()
+            return
         running = self.manager.running()
         if running and not self.confirm_quit(len(running)):
+            self._quitting = False
             event.ignore()
             return
         self.manager.shutdown()
         event.accept()
+        if self.tray is not None:
+            self.tray.hide()
+            QTimer.singleShot(0, QApplication.quit)  # (the app does not quit on "last window closed" with a tray)
+
+    # ------------------------------------------------------------------ tray
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _show_session_from_tray(self, session: Session) -> None:
+        self.show_from_tray()
+        self.show_session(session)
+
+    def quit_app(self) -> None:
+        """Tray "Quit" / real quit: asks first if something is running, then stops everything and exits."""
+        self._quitting = True
+        self.close()

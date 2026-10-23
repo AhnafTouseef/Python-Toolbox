@@ -74,6 +74,13 @@ scrollbar does not jump. Resizing re-places existing cards and keeps the row you
 at. Each card has a hover glow, a status pill (Running / Completed / Failed / Stopped / Launch
 error) and a settings button (also **F2** or the context menu when a card is focused).
 
+**Pinned tools and the editor.** The pin on a card (shown on hover, always shown while pinned; also in the
+right-click menu) pins the tool to the top of the library; pinned tools come first, in the usual order, and the pins
+are saved in `config.json` (`"pinned"`, by tool id - a pin of a tool whose folder is missing is kept for when it
+comes back). *Open main.py in editor* (right-click menu, or the pencil button in the cockpit) opens the tool's
+`main.py` with the system's editor: on Windows through the shell's **Edit** verb (never *Open*, which for `.py` files
+usually runs the script; Notepad if no editor is registered), on macOS `open -t`, on Linux `xdg-open`.
+
 **Tool metadata.** `tool.json` holds exactly four fields: `name`, `description`, `icon`
 (a bundled Lucide icon), `color` (hex). Missing or invalid fields are repaired one at a time;
 valid customisations and unknown extra fields are preserved; a malformed file is backed up
@@ -105,6 +112,16 @@ terminal, a stdin field and Clear.
 * **Clear** only clears the display.
 * Closing the application with running processes asks, then stops them.
 
+**System tray and notifications.** The window's close button sends the window to the system tray instead of
+quitting: running tools and queues keep going. Click the tray icon to bring the window back; **Quit** in its menu
+asks first if something is still running, then stops everything and exits. The tray menu also shows how many
+instances are running and has a **Notifications** switch (saved as `"notifications"` in `config.json`). A
+notification is shown when an instance's main process ends (finished / failed / could not start) or its queue ends
+(finished / finished with failures / stopped by a failure or timeout) - one per run (a main process whose queue is
+about to run is announced when the queue ends), never for something you stopped yourself, and only while the window
+is not in front. Clicking it opens that instance. Without a system tray (some Linux desktops) the close button quits
+as before and no notifications are shown.
+
 **Active-process drawer.** The *Active* button slides a panel in from the right over the
 library (about one third of the window, 300–460 px) listing each running instance. Click an
 item to jump to that exact tab; close with ✕, Esc or by clicking outside. It never affects
@@ -117,6 +134,13 @@ right-side drawer that overlays the cockpit exactly like the active-process draw
 never resized). Use it to prepare work while a long job is still running; the cells run one after another once
 the main process has **exited**.
 
+* **Cell layout (like Jupyter).** A **play button** sits at the left of every cell and runs just that cell now. The
+  **toolbar at the top right** is, left to right: *up, down, run from this cell* (this cell and every cell below
+  it), *duplicate* (a copy of the configuration right below it) and *delete* (the paperclip and, for tool cells, the
+  pencil sit just before them). While a cell runs its play button becomes a **stop** button. A code cell **grows
+  line by line** as you type (the drawer scrolls, not the cell). **Run now** in the queue header runs every pending
+  cell immediately, without the main process. Manual runs need the instance to be idle (no main process and no cell
+  running) and follow the same Must Execute rules; cells outside the chosen range are left untouched.
 * **Notebook-style cells.** The drawer works like a notebook. In the blank space (and after the last cell) there
   are two buttons, **+ Code** and **+ Tool**; hovering over a cell opens the same two buttons right below it (and
   above the first cell), so a cell can be inserted anywhere between two others.
@@ -207,8 +231,8 @@ Scripts run through pipes, not a real console:
 
 ## Configuration
 
-`config.json` (next to `app.py`): `{ "global_python": null, "tool_paths": [] }`. `null` = the interpreter running
-the toolbox; `tool_paths` = extra folders to look for tools in (managed by the folder button in the library).
+`config.json` (next to `app.py`): `{ "global_python": null, "tool_paths": [], "pinned": [], "notifications": true }`. `null` = the interpreter running
+the toolbox; `tool_paths` = extra folders to look for tools in (managed by the folder button in the library); `pinned` = pinned tool ids; `notifications` = desktop notifications on/off.
 
 ## Tests
 
@@ -218,7 +242,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-272 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+330 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output
@@ -271,6 +295,8 @@ app/
   queue_dialogs.py          searchable tool picker, save-preset and presets dialogs
   presets.py                global queue presets (JSON files in presets/) - no Qt
   tool_folders.py           dialog to add / remove extra tool folders
+  tray.py                   system tray icon + menu, desktop notifications
+  editor.py                 open a tool's main.py in the system editor
   gc_guard.py               keeps Python's GC on the GUI thread (see source)
   error_reporting.py        unexpected-error dialog, always shown from the GUI thread
   theme.py                  dark palette and stylesheet

@@ -53,7 +53,7 @@ STATE_COLORS = {
 ACCENT = theme.INFO
 OUTPUT_HEIGHT = 150            # inline output area of a cell
 REPLAY_CHARS = 200_000         # an inline view replays at most the tail of a very long output
-CODE_MIN_LINES, CODE_MAX_LINES = 3, 12
+CODE_MIN_LINES, CODE_MAX_LINES = 2, 500     # a cell grows line by line up to this many lines, then it scrolls
 
 
 def rgba(color: str, alpha: float) -> str:
@@ -161,24 +161,42 @@ class Switch(QCheckBox):
 
 
 class CodeEdit(QPlainTextEdit):
-    """The code of a code cell: monospace, no wrapping, Tab = four spaces, grows with its content."""
+    """The code of a code cell: monospace, no wrapping, Tab = four spaces. Like a notebook cell it grows with its
+    content (it never scrolls inside itself); the drawer scrolls instead."""
+
+    cursorRectChanged = Signal(object)          # QRect in this widget's coordinates
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("CodeEdit")
         self.setFont(theme.mono_font(10))
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTabChangesFocus(False)
         self.setAccessibleName("Cell code")
         self.setStyleSheet(f"#CodeEdit {{ background: {theme.TERM_BG}; border: 1px solid {theme.BORDER};"
                            f" border-radius: 8px; padding: 4px 6px; }}"
                            f"#CodeEdit:focus {{ border: 1px solid {ACCENT}; }}")
         self.document().contentsChanged.connect(self.fit_height)
+        self.horizontalScrollBar().rangeChanged.connect(lambda *_: self.fit_height())
+        self.cursorPositionChanged.connect(lambda: self.cursorRectChanged.emit(self.cursorRect()))
         self.fit_height()
 
     def fit_height(self) -> None:
         lines = min(CODE_MAX_LINES, max(CODE_MIN_LINES, self.document().blockCount()))
-        self.setFixedHeight(lines * QFontMetrics(self.font()).lineSpacing() + 22)
+        bar = self.horizontalScrollBar()
+        extra = bar.sizeHint().height() if bar.maximum() > 0 else 0
+        self.setFixedHeight(lines * QFontMetrics(self.font()).lineSpacing() + 22 + extra)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.fit_height()                                               # the font is final once the widget is polished
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:      # sideways scrolling of a long line still works
+            super().wheelEvent(event)
+        else:
+            event.ignore()                                              # the drawer scrolls, not the cell
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Tab and not self.isReadOnly():
@@ -254,6 +272,11 @@ class CellCard(QFrame):
     expandedChanged = Signal(object, bool)
     outputToggled = Signal(object, bool)
     inputSubmitted = Signal(object, str)
+    runCellRequested = Signal(object)
+    runFromRequested = Signal(object)
+    duplicateRequested = Signal(object)
+    stopRequested = Signal()
+    cursorVisible = Signal(object, object)       # (widget, rect): keep the text cursor in view while typing
 
     def __init__(self, queue: SessionQueue, cell: QueueCell, icons: IconManager, expanded: bool, output_hidden: bool,
                  parent: QWidget | None = None):
@@ -263,7 +286,15 @@ class CellCard(QFrame):
         self._shown = 0                                     # characters currently displayed in the inline output
         self.setObjectName("CellCard")
 
-        # -- header: tile, title + status, paperclip (right) --------------------------------------
+        # -- left gutter: the play button (like a notebook) ---------------------------------------------
+        self.play = QToolButton()
+        self.play.setObjectName("Flat")
+        self.play.setFixedSize(34, 34)
+        self.play.setIconSize(QSize(18, 18))
+        self.play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play.setAccessibleName("Run this cell")
+
+        # -- header: tile, title + status ... toolbar (top right) --------------------------------------------
         self.tile = QLabel()
         self.tile.setFixedSize(32, 32)
         self.tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -277,15 +308,29 @@ class CellCard(QFrame):
         self.clip = QToolButton()
         self.clip.setObjectName("Flat")
         self.clip.setCheckable(True)
-        self.clip.setFixedSize(28, 28)
-        self.clip.setIconSize(QSize(16, 16))
+        self.clip.setFixedSize(24, 24)
+        self.clip.setIconSize(QSize(14, 14))
         self.clip.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clip.setAccessibleName("Predefined answers")
+        self.edit = flat_button(icons, "pencil", "Change the tool / name of this cell", "Edit cell")
+        self.up = flat_button(icons, "arrow-up", "Move up", "Move cell up")
+        self.down = flat_button(icons, "arrow-down", "Move down", "Move cell down")
+        self.run_from = flat_button(icons, "fast-forward", "Run from this cell: this cell and every cell below it",
+                                    "Run from this cell")
+        self.duplicate = flat_button(icons, "copy", "Duplicate this cell (a copy is added right below it)", "Duplicate cell")
+        self.remove = flat_button(icons, "trash-2", "Delete this cell", "Delete cell")
+        toolbar = QHBoxLayout()                  # left to right: up, down, run from here, duplicate, delete
+        toolbar.setSpacing(0)
+        toolbar.addWidget(self.clip)
+        toolbar.addWidget(self.edit)
+        toolbar.addSpacing(6)
+        for w in (self.up, self.down, self.run_from, self.duplicate, self.remove):
+            toolbar.addWidget(w)
         top = QHBoxLayout()
         top.setSpacing(10)
         top.addWidget(self.tile)
         top.addLayout(texts, 1)
-        top.addWidget(self.clip, 0, Qt.AlignmentFlag.AlignTop)
+        top.addLayout(toolbar)
 
         # -- code (code cells only) ------------------------------------------------------------
         self.code = CodeEdit()
@@ -293,12 +338,6 @@ class CellCard(QFrame):
         self.code_note = QLabel()
         self.code_note.setWordWrap(True)
         self.code_note.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: 11px;")
-
-        # -- action row ----------------------------------------------------------------------
-        self.up = flat_button(icons, "arrow-up", "Move up", "Move cell up")
-        self.down = flat_button(icons, "arrow-down", "Move down", "Move cell down")
-        self.edit = flat_button(icons, "pencil", "Change the tool / name of this cell", "Edit cell")
-        self.remove = flat_button(icons, "trash-2", "Remove this cell", "Remove cell")
         self.language = QComboBox()
         self.language.setAccessibleName("Code language")
         self.language.setToolTip("Python: runs with this tool's interpreter.  Shell: a command or script for "
@@ -316,11 +355,9 @@ class CellCard(QFrame):
         self.output_toggle.setAccessibleName("Show or hide the cell output")
         self.output_toggle.setToolTip("Show or hide what this cell printed")
         actions = QHBoxLayout()
-        actions.setSpacing(2)
-        for w in (self.up, self.down, self.edit, self.remove):
-            actions.addWidget(w)
-        actions.addSpacing(6)
+        actions.setSpacing(8)
         actions.addWidget(self.language)
+        actions.addWidget(self.code_note)
         actions.addStretch(1)
         actions.addWidget(self.output_toggle)
 
@@ -363,15 +400,18 @@ class CellCard(QFrame):
         ol.addWidget(self.terminal)
         ol.addWidget(self.input)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 10, 8)
+        body = QVBoxLayout()
+        body.setSpacing(6)
+        body.addLayout(top)
+        body.addWidget(self.code)
+        body.addLayout(actions)
+        body.addWidget(self.pane)
+        body.addWidget(self.out_box)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 10, 8, 8)
         lay.setSpacing(6)
-        lay.addLayout(top)
-        lay.addWidget(self.code)
-        lay.addWidget(self.code_note)
-        lay.addLayout(actions)
-        lay.addWidget(self.pane)
-        lay.addWidget(self.out_box)
+        lay.addWidget(self.play, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(body, 1)
 
         self.clip.toggled.connect(self._on_clip)
         self.output_toggle.toggled.connect(self._on_output_toggle)
@@ -383,6 +423,10 @@ class CellCard(QFrame):
         self.down.clicked.connect(lambda: self.moveRequested.emit(self.cell, 1))
         self.edit.clicked.connect(lambda: self.editRequested.emit(self.cell))
         self.remove.clicked.connect(lambda: self.removeRequested.emit(self.cell))
+        self.duplicate.clicked.connect(lambda: self.duplicateRequested.emit(self.cell))
+        self.run_from.clicked.connect(lambda: self.runFromRequested.emit(self.cell))
+        self.play.clicked.connect(self._on_play)
+        self.code.cursorRectChanged.connect(lambda r: self.cursorVisible.emit(self.code, r))
 
         self.answers.setText(cell.answers_text)
         for w, v in ((self.clip, expanded), (self.output_toggle, not output_hidden)):
@@ -394,6 +438,12 @@ class CellCard(QFrame):
         self.replay()
 
     # ------------------------------------------------------------------ interaction
+    def _on_play(self) -> None:
+        if self.cell.is_active:
+            self.stopRequested.emit()                       # the button shows "stop" while this cell runs
+        else:
+            self.runCellRequested.emit(self.cell)
+
     def _on_clip(self, checked: bool) -> None:
         self.pane.setVisible(checked)
         self.expandedChanged.emit(self.cell, checked)
@@ -544,12 +594,41 @@ class CellCard(QFrame):
         c = self.cell
         if c.language == LANG_SHELL:
             where = "cmd.exe (as a batch script)" if IS_WINDOWS else "/bin/sh"
-            self.code_note.setText(f"Shell command or script, run with {where} in the tool folder.")
+            self.code_note.setText(f"Runs with {where} in the tool folder.")
             self.code.setPlaceholderText("shutdown /s /t 60" if IS_WINDOWS else "echo done")
         else:
-            self.code_note.setText("Python code, run with this tool's interpreter (its .venv, else the global Python) "
-                                   "in the tool folder.")
+            self.code_note.setText("Runs with the tool's interpreter in the tool folder.")
             self.code.setPlaceholderText("# Python code — e.g.\nimport time\ntime.sleep(5)\nprint('done')")
+
+    def refresh_controls(self) -> None:
+        """Play / toolbar buttons: what can be done with this cell right now."""
+        c, q = self.cell, self.queue
+        pending, is_code = c.is_pending, c.kind is CellKind.CODE
+        can_run = pending and q.can_start
+        if c.is_active:
+            self.play.setIcon(self._icons.icon("square", theme.ERR, 18))
+            self.play.setToolTip("Stop: stops this cell and cancels the cells that have not started")
+            self.play.setAccessibleName("Stop this cell")
+            self.play.setEnabled(True)
+        else:
+            self.play.setIcon(self._icons.icon("play", theme.OK if can_run else theme.TEXT_DIM, 18))
+            self.play.setAccessibleName("Run this cell")
+            self.play.setEnabled(can_run)
+            if can_run:
+                self.play.setToolTip("Run this cell now")
+            elif pending:
+                self.play.setToolTip("Not available while the main process or another cell is running")
+            else:
+                self.play.setToolTip("")
+        self.up.setVisible(pending)
+        self.down.setVisible(pending)
+        self.run_from.setVisible(pending)
+        self.edit.setVisible(pending and not is_code)
+        self.up.setEnabled(q.can_move(c, -1))
+        self.down.setEnabled(q.can_move(c, 1))
+        self.run_from.setEnabled(can_run)
+        self.duplicate.setVisible(True)
+        self.remove.setVisible(not c.is_active)
 
     def refresh(self) -> None:
         c = self.cell
@@ -579,12 +658,7 @@ class CellCard(QFrame):
             self._sync_language()
             self._refresh_code_note()
         # actions
-        self.up.setVisible(pending)
-        self.down.setVisible(pending)
-        self.edit.setVisible(pending and not is_code)
-        self.up.setEnabled(self.queue.can_move(c, -1))
-        self.down.setEnabled(self.queue.can_move(c, 1))
-        self.remove.setVisible(not c.is_active)
+        self.refresh_controls()
         self.language.setEnabled(pending)
         self.answers.setEnabled(pending)
         if self.answers.text() != c.answers_text and not self.answers.hasFocus():
@@ -669,7 +743,16 @@ class QueueDrawer(SlideDrawer):
         self.stop_button.setFixedHeight(26)
         self.stop_button.setStyleSheet("padding: 0 10px;")
         self.stop_button.clicked.connect(self._stop)
+        self.run_now_button = QPushButton(" Run now")
+        self.run_now_button.setObjectName("Primary")
+        self.run_now_button.setIcon(self._icons.icon("play", theme.TEXT, 14))
+        self.run_now_button.setFixedHeight(26)
+        self.run_now_button.setStyleSheet("padding: 0 12px;")
+        self.run_now_button.setToolTip("Run every cell now, without waiting for the main process")
+        self.run_now_button.setAccessibleName("Run the queue now")
+        self.run_now_button.clicked.connect(self._run_now)
         bl.addWidget(self.state_label, 1)
+        bl.addWidget(self.run_now_button)
         bl.addWidget(self.stop_button)
         lay.addWidget(self.banner)
 
@@ -815,6 +898,11 @@ class QueueDrawer(SlideDrawer):
             card.expandedChanged.connect(self._remember_expanded)
             card.outputToggled.connect(self._remember_output_hidden)
             card.inputSubmitted.connect(self._send_input)
+            card.runCellRequested.connect(lambda c: q.run_cell(c.id))
+            card.runFromRequested.connect(lambda c: q.run_from(c.id))
+            card.duplicateRequested.connect(self.duplicate_cell)
+            card.stopRequested.connect(self._stop)
+            card.cursorVisible.connect(self._keep_visible)
             card.installEventFilter(self)
             self._cards[cell.id] = card
             self._list.addWidget(card)
@@ -858,6 +946,7 @@ class QueueDrawer(SlideDrawer):
         self.banner.setStyleSheet(f"#Banner {{ background: {rgba(color, 0.10)}; border: 1px solid {rgba(color, 0.35)};"
                                   f" border-radius: 10px; }}")
         self.save_preset_button.setEnabled(bool(q.cells))
+        self.run_now_button.setVisible(q.can_start)
         self.stop_button.setVisible(q.executing)
         self.stop_button.setText(" Force stop" if q.stopping else " Stop queue")
         self.stop_button.setToolTip("Stop the running cell and cancel the cells that have not started"
@@ -877,6 +966,7 @@ class QueueDrawer(SlideDrawer):
         self._refresh_header()
         for card in self._cards.values():                       # e.g. the input line follows "stopping"
             card._refresh_output_visibility()
+            card.refresh_controls()                             # play / run-from depend on what is running
 
     def _on_cell(self, cell: QueueCell) -> None:
         card = self._cards.get(cell.id)
@@ -948,6 +1038,30 @@ class QueueDrawer(SlideDrawer):
     def _stop(self) -> None:
         if self.queue is not None:
             self.queue.stop()
+
+    def _run_now(self) -> None:
+        if self.queue is not None:
+            self.queue.run_now()
+
+    def duplicate_cell(self, cell: QueueCell) -> None:
+        if self.queue is None:
+            return
+        copy = self.queue.duplicate_cell(cell.id)
+        if copy is not None and copy.id in self._cards:
+            self._cards[copy.id].code.setFocus() if copy.kind is CellKind.CODE else None
+            QTimer.singleShot(0, lambda c=copy: self._cards.get(c.id) and self.scroll.ensureWidgetVisible(self._cards[c.id]))
+
+    def _keep_visible(self, widget: QWidget, rect) -> None:
+        """Typing at the bottom of a growing code cell: scroll the drawer so the cursor stays on screen."""
+        def go():
+            try:
+                if not self.scroll.widget().isAncestorOf(widget):
+                    return                                        # the card was rebuilt / removed meanwhile
+                pt = widget.mapTo(self.scroll.widget(), rect.bottomLeft())
+                self.scroll.ensureVisible(pt.x(), pt.y(), 0, 48)
+            except RuntimeError:
+                pass                                              # the card was rebuilt meanwhile
+        QTimer.singleShot(0, go)
 
     def insert_code(self, index: int) -> None:
         """"+ Code": a new empty Python cell at ``index``; its editor gets the keyboard focus."""
