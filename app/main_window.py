@@ -20,6 +20,7 @@ from .presets import PresetStore
 from .tool_folders import ToolFoldersDialog
 from .tool_registry import ToolRegistry
 from .tool_settings import ToolSettingsDialog
+from .workflow_view import WorkflowView
 from .workspace_view import WorkspaceView
 
 log = logging.getLogger(__name__)
@@ -61,8 +62,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stage)
         self.library = LibraryView(registry, icons, manager.tool_status)
         self.workspace = WorkspaceView(manager, registry, icons)
+        self.workflows = WorkflowView(manager, registry, icons, self.presets)
         self.stage.pages.addWidget(self.library)
         self.stage.pages.addWidget(self.workspace)
+        self.stage.pages.addWidget(self.workflows)
         self.drawer = ActiveProcessDrawer(manager, icons, self.stage)
         self.stage.drawer = self.drawer
         self.queue_drawer = QueueDrawer(manager, registry, icons, self.stage, self.presets)
@@ -76,6 +79,11 @@ class MainWindow(QMainWindow):
         self.library.activeRequested.connect(self.drawer.open_drawer)
         self.library.refreshRequested.connect(self.refresh_tools)
         self.library.foldersRequested.connect(self.open_tool_folders)
+        self.library.workflowsRequested.connect(self.open_workflows)
+        self.workflows.backRequested.connect(self.show_library)
+        self.workflows.newRequested.connect(self.new_workflow)
+        self.workflows.closeRequested.connect(self.close_workflow)
+        self.workflows.quickCloseRequested.connect(lambda sess: self.close_workflow(sess, confirm=False))
         self.workspace.backRequested.connect(self.show_library)
         self.workspace.queueRequested.connect(self.open_queue)
         self.workspace.currentChanged.connect(self._on_current_session)
@@ -135,9 +143,46 @@ class MainWindow(QMainWindow):
         self.show_workspace()
 
     def show_session(self, session: Session) -> None:
-        """Jump to one exact instance (used by the active-process drawer)."""
+        """Jump to one exact instance or workflow (used by the active-process drawer)."""
+        if session.is_workflow:
+            self.workflows.select_session(session)
+            self.stage.pages.setCurrentWidget(self.workflows)
+            return
         self.workspace.select_session(session)
         self.show_workspace()
+
+    # ------------------------------------------------------------------ workflows
+    def open_workflows(self) -> None:
+        """The library's Workflows button: the most recent workflow, or a first one."""
+        flows = self.manager.workflows()
+        s = max(flows, key=lambda w: w.last_active) if flows else self.manager.create_workflow()
+        self.show_session(s)
+
+    def new_workflow(self) -> None:
+        self.show_session(self.manager.create_workflow())
+
+    def close_workflow(self, session: Session, confirm: bool = True) -> None:
+        """Destroy a workflow. It is not saved anywhere: its cells are gone (a preset keeps them)."""
+        if confirm and (session.is_active or session.queue.cells) and not self.confirm_close_workflow(session):
+            return
+        self.manager.remove(session)
+        if not self.manager.workflows():
+            self.show_library()
+
+    def confirm_close_workflow(self, session: Session) -> bool:
+        cells = len(session.queue.cells)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Close workflow?")
+        box.setText(f"“{self.manager.label(session)}” " + ("is still running." if session.is_active else
+                                                          f"has {cells} cell{'s' if cells != 1 else ''}."))
+        box.setInformativeText(("The running cell is stopped. " if session.is_active else "")
+                               + "Closing discards its cells. Use “Save as preset” first to keep them.")
+        close = box.addButton("Close workflow", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep it", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        return box.clickedButton() is close
 
     def new_instance(self) -> None:
         current = self.workspace.current_session()
@@ -171,7 +216,7 @@ class MainWindow(QMainWindow):
         if confirm and session.is_active and not self.confirm_stop_and_close(session):
             return
         self.manager.remove(session)                 # destroys output/state; stops a live process
-        if not self.manager.sessions:
+        if not self.manager.tool_sessions():
             self.show_library()                      # last tab closed -> back to the library
         else:
             self.workspace.refresh_all()

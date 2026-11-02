@@ -592,12 +592,16 @@ class CellCard(QFrame):
 
     def _refresh_code_note(self) -> None:
         c = self.cell
+        folder = "the working folder" if self.queue.session.is_workflow else "the tool folder"
         if c.language == LANG_SHELL:
             where = "cmd.exe (as a batch script)" if IS_WINDOWS else "/bin/sh"
-            self.code_note.setText(f"Runs with {where} in the tool folder.")
+            self.code_note.setText(f"Runs with {where} in {folder}.")
             self.code.setPlaceholderText("shutdown /s /t 60" if IS_WINDOWS else "echo done")
         else:
-            self.code_note.setText("Runs with the tool's interpreter in the tool folder.")
+            self.code_note.setText(("Runs with the Python of the working folder (its .venv, else the global one)."
+                                    if self.queue.session.is_workflow else
+                                    "Runs with the tool's interpreter in the tool folder.")
+                                   + " Variables are shared with the other Python cells until the run ends.")
             self.code.setPlaceholderText("# Python code — e.g.\nimport time\ntime.sleep(5)\nprint('done')")
 
     def refresh_controls(self) -> None:
@@ -676,8 +680,8 @@ class CellCard(QFrame):
 # =============================================================================== the drawer
 class QueueDrawer(SlideDrawer):
     def __init__(self, manager: SessionManager, registry: ToolRegistry, icons: IconManager, parent: QWidget,
-                 presets: PresetStore | None = None):
-        super().__init__(parent)
+                 presets: PresetStore | None = None, docked: bool = False):
+        super().__init__(parent, docked)
         self._manager, self._registry, self._icons = manager, registry, icons
         self._presets = presets
         self.session: Session | None = None
@@ -703,6 +707,23 @@ class QueueDrawer(SlideDrawer):
         self._clock.setInterval(1000)
         self._clock.timeout.connect(self._tick_clock)
         manager.sessionRemoved.connect(self._on_session_removed)
+        if docked:
+            self.close_button.hide()                       # a page, not an overlay: nothing to close
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self.docked:
+            self._clock.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        if self.docked:
+            self._clock.stop()
+
+    @property
+    def standalone(self) -> bool:
+        """The bound session is a workflow (no main process, no tool): same panel, different wording."""
+        return self.session is not None and self.session.is_workflow
 
     # ------------------------------------------------------------------ geometry
     def panel_width(self, window_width: int) -> int:
@@ -887,6 +908,10 @@ class QueueDrawer(SlideDrawer):
             self.subtitle.setFullText("")
             self.empty.show()
             return
+        self.empty.setText("Add code cells and tool cells below.\nPress Run now to run them one after another."
+                           if self.standalone else
+                           "Add code cells and tool cells below.\nThey run one after another as soon as the main "
+                           "process has finished.")
         opened = self._expanded.setdefault(self.session.id, set())
         hidden = self._out_hidden.setdefault(self.session.id, set())
         for i, cell in enumerate(q.cells):
@@ -939,8 +964,12 @@ class QueueDrawer(SlideDrawer):
         q, session = self.queue, self.session
         if q is None or session is None:
             return
-        self.title.setText("Queue")
-        self.subtitle.setFullText(f"for {self._manager.label(session)}")
+        if self.standalone:
+            self.title.setText(self._manager.label(session))
+            self.subtitle.setFullText(f"Working folder: {session.tool.path}")
+        else:
+            self.title.setText("Queue")
+            self.subtitle.setFullText(f"for {self._manager.label(session)}")
         color = STATE_COLORS[q.state]
         self.state_label.setText(f"<span style='color:{color}'>●</span>&nbsp; {q.state_text}")
         self.banner.setStyleSheet(f"#Banner {{ background: {rgba(color, 0.10)}; border: 1px solid {rgba(color, 0.35)};"
@@ -958,9 +987,13 @@ class QueueDrawer(SlideDrawer):
         on = q.must_execute
         self.must_state.setText("ON" if on else "OFF")
         self.must_state.setStyleSheet(f"font-weight: 700; font-size: 12px; color: {theme.OK if on else theme.TEXT_MUTED};")
-        self.must_note.setText("Runs even if the main process fails, continues after a failed cell, and stops a Python cell "
-                               "that waits for input for 5 minutes." if on else
-                               "Runs only if the main process succeeds, and stops at the first failed cell.")
+        if self.standalone:
+            self.must_note.setText("Continues after a failed cell, and stops a Python cell that waits for input for "
+                                   "5 minutes." if on else "Stops at the first failed cell.")
+        else:
+            self.must_note.setText("Runs even if the main process fails, continues after a failed cell, and stops a "
+                                   "Python cell that waits for input for 5 minutes." if on else
+                                   "Runs only if the main process succeeds, and stops at the first failed cell.")
 
     def _on_state(self) -> None:
         self._refresh_header()

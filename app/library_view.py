@@ -147,6 +147,7 @@ class LibraryView(QWidget):
     pinRequested = Signal(str)
     editRequested = Signal(str)
     foldersRequested = Signal()
+    workflowsRequested = Signal()
 
     def __init__(self, registry: ToolRegistry, icons: IconManager, status_provider: StatusProvider,
                  parent: QWidget | None = None):
@@ -194,6 +195,10 @@ class LibraryView(QWidget):
         self._active_btn.setIcon(icons.icon("activity", theme.TEXT, 16))
         self._active_btn.setToolTip("Show running processes")
         self._active_btn.setAccessibleName("Active processes")
+        self._workflows_btn = QPushButton(" Workflows")
+        self._workflows_btn.setIcon(icons.icon("workflow", theme.TEXT, 16))
+        self._workflows_btn.setToolTip("Workflows: queues of code and tool cells that run on their own, without a tool")
+        self._workflows_btn.setAccessibleName("Workflows")
         self._notice = QLabel()
         self._notice.setStyleSheet(f"color: {theme.INFO}; font-size: 12px;")
         self._notice.setAccessibleName("Refresh result")
@@ -225,6 +230,7 @@ class LibraryView(QWidget):
         hl.addWidget(self._search, 2)
         hl.addWidget(self._refresh_btn)
         hl.addWidget(self._folders_btn)
+        hl.addWidget(self._workflows_btn)
         hl.addWidget(self._active_btn)
 
         self._banner = IssueBanner()
@@ -264,6 +270,7 @@ class LibraryView(QWidget):
         self._sb.valueChanged.connect(self._on_scroll)             # scroll => scheduling only
         self._search.textChanged.connect(self._on_search)
         self._active_btn.clicked.connect(self.activeRequested)
+        self._workflows_btn.clicked.connect(self.workflowsRequested)
         self._refresh_btn.clicked.connect(self.refreshRequested)
         self._folders_btn.clicked.connect(self.foldersRequested)
         QShortcut(QKeySequence(Qt.Key.Key_F5), self, self.refreshRequested.emit)

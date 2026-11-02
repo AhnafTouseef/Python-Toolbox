@@ -2,13 +2,15 @@
 
 config.json lives next to app.py:
 
-    { "global_python": null, "tool_paths": [], "pinned": [], "notifications": true }
+    { "global_python": null, "tool_paths": [], "pinned": [], "notifications": true, "tool_answers": {} }
 
 `null` means "use the interpreter that is running the toolbox". Set it to the full
 path of a python.exe to use a different global interpreter for tools without a .venv.
 `tool_paths` lists extra folders to look for tools in (each holds tool folders, like tools/ does);
 the application's own tools/ folder is always searched first.  `pinned` lists the tools pinned to the top of the
 library (their ids: the folder name for tools/, the full folder path for tools of added folders).
+`tool_answers` maps a tool id to the predefined answers ("1920, 1080, yes") that new runs of that tool start with;
+an entry exists only for tools whose "Keep for this tool" box is ticked.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ class AppConfig:
     tool_paths: list[str] = field(default_factory=list)
     pinned: list[str] = field(default_factory=list)
     notifications: bool = True
+    tool_answers: dict[str, str] = field(default_factory=dict)
     notice: str | None = None  # set when the file was unreadable/invalid
     _other: dict = field(default_factory=dict, repr=False)      # unknown keys, written back untouched
 
@@ -49,7 +52,16 @@ class AppConfig:
         data["tool_paths"] = list(self.tool_paths)
         data["pinned"] = list(self.pinned)
         data["notifications"] = self.notifications
+        data["tool_answers"] = dict(self.tool_answers)
         return data
+
+    def set_tool_answers(self, tool_id: str, text: str | None) -> str | None:
+        """Keep (text) or forget (None / blank) a tool's predefined answers, then save. Returns an error or None."""
+        if text is not None and text.strip():
+            self.tool_answers[tool_id] = text.strip()
+        else:
+            self.tool_answers.pop(tool_id, None)
+        return self.save()
 
     def save(self) -> str | None:
         """Write config.json. Returns an error message, or None when it was saved."""
@@ -71,7 +83,8 @@ class AppConfig:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("expected a JSON object")
-            cfg._other = {k: v for k, v in data.items() if k not in ("global_python", "tool_paths", "pinned", "notifications")}
+            cfg._other = {k: v for k, v in data.items() if k not in ("global_python", "tool_paths", "pinned", "notifications",
+                                                                  "tool_answers")}
             value = data.get("global_python")
             if value is None or (isinstance(value, str) and not value.strip()):
                 cfg.global_python = None
@@ -95,6 +108,15 @@ class AppConfig:
                     cfg.tool_paths.append(entry.strip())
             if isinstance(data.get("notifications"), bool):
                 cfg.notifications = data["notifications"]
+            saved = data.get("tool_answers", {})
+            if isinstance(saved, dict):
+                for key, value in saved.items():
+                    if isinstance(key, str) and isinstance(value, str) and value.strip():
+                        cfg.tool_answers[key] = value.strip()
+                    else:
+                        cfg.notice = "config.json: an invalid entry in 'tool_answers' was ignored."
+            elif saved is not None:
+                cfg.notice = "config.json: 'tool_answers' must be an object; ignored."
             pins = data.get("pinned", [])
             if isinstance(pins, list):
                 for entry in pins:

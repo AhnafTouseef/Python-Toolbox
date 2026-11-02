@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QStackedWidget,
-                               QTabBar, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy,
+                               QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import theme
 from .icon_manager import IconManager
+from .queue_drawer import ACCENT, rgba
 from .session_manager import Session, SessionManager, SessionStatus
 from .terminal_view import TerminalView
 from .tool_registry import ToolRegistry
@@ -138,6 +139,13 @@ class WorkspaceView(QWidget):
         self.status = QLabel()
         self.status.setMinimumWidth(40)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.clip_button = QToolButton()                  # predefined answers for the main process (like a cell's clip)
+        self.clip_button.setObjectName("Flat")
+        self.clip_button.setCheckable(True)
+        self.clip_button.setIconSize(QSize(18, 18))
+        self.clip_button.setFixedSize(32, 32)
+        self.clip_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clip_button.setAccessibleName("Predefined answers")
         self.edit_button = QToolButton()
         self.edit_button.setObjectName("Flat")
         self.edit_button.setIcon(icons.icon("square-pen", theme.TEXT, 18))
@@ -155,9 +163,42 @@ class WorkspaceView(QWidget):
         bl.addWidget(self.tile)
         bl.addWidget(self.title, 3)
         bl.addWidget(self.status, 2)
+        bl.addWidget(self.clip_button)
         bl.addWidget(self.edit_button)
         bl.addWidget(self.queue_button)
         bl.addWidget(self.run_button)
+
+        # -- predefined answers of the main process (opened with the paperclip), like a queue cell's --------
+        self.answer_panel = QFrame()
+        self.answer_panel.setObjectName("AnswerPane")
+        self.answer_panel.setStyleSheet(
+            f"#AnswerPane {{ background: {rgba(ACCENT, 0.10)}; border: none; border-bottom: 1px solid {rgba(ACCENT, 0.35)}; }}")
+        al = QVBoxLayout(self.answer_panel)
+        al.setContentsMargins(16, 8, 16, 8)
+        al.setSpacing(6)
+        cap = QLabel("Predefined answers for this tool, in order — one is typed each time the script asks for input")
+        cap.setWordWrap(True)
+        cap.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
+        self.answers_edit = QLineEdit()
+        self.answers_edit.setPlaceholderText("1920, 1080, yes")
+        self.answers_edit.setAccessibleName("Predefined answers")
+        self.answers_edit.setStyleSheet(f"background: {rgba('#000000', 0.25)};")
+        self.keep_box = QCheckBox("Keep for this tool")
+        self.keep_box.setAccessibleName("Keep the answers for this tool")
+        self.keep_box.setToolTip("Tick to save these answers: every new run and every new instance of this tool starts "
+                                 "with them. Untick to use them for this instance only.")
+        self.answer_hint = QLabel()
+        self.answer_hint.setWordWrap(True)
+        self.answer_hint.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 12px;")
+        arow = QHBoxLayout()
+        arow.setSpacing(12)
+        arow.addWidget(self.answers_edit, 1)
+        arow.addWidget(self.keep_box)
+        al.addWidget(cap)
+        al.addLayout(arow)
+        al.addWidget(self.answer_hint)
+        self.answer_panel.hide()
+        self._answers_open: set[str] = set()          # sessions whose answers area is open
 
         self.stack = QStackedWidget()
         self._placeholder = QLabel("No instance open.")
@@ -170,6 +211,7 @@ class WorkspaceView(QWidget):
         lay.setSpacing(0)
         lay.addWidget(top)
         lay.addWidget(bar)
+        lay.addWidget(self.answer_panel)
         lay.addWidget(self.stack, 1)
 
         self.back_button.clicked.connect(self.backRequested)
@@ -177,6 +219,9 @@ class WorkspaceView(QWidget):
         self.run_button.clicked.connect(self._run_or_stop)
         self.queue_button.clicked.connect(self.queueRequested)
         self.edit_button.clicked.connect(lambda: self.editRequested.emit(self.current_session()))
+        self.clip_button.toggled.connect(self._on_clip)
+        self.answers_edit.textEdited.connect(self._on_answers_edited)
+        self.keep_box.toggled.connect(self._on_keep)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBarDoubleClicked.connect(self._tab_double_clicked)
         manager.sessionAdded.connect(self.add_session)
@@ -200,6 +245,8 @@ class WorkspaceView(QWidget):
         return self._panes.get(session.id)
 
     def add_session(self, session: Session) -> None:
+        if session.is_workflow:
+            return                                  # workflows have their own page (workflow_view.py)
         pane = SessionPane(session)
         self._panes[session.id] = pane
         self.stack.addWidget(pane)
@@ -214,13 +261,17 @@ class WorkspaceView(QWidget):
         close.setAccessibleName("Close instance")
         close.clicked.connect(lambda _=False, sid=session.id: self._close_clicked(sid))
         self.tabs.setTabButton(idx, QTabBar.ButtonPosition.RightSide, close)
+        session.answersChanged.connect(self._on_answers_changed)
         session.queue.structureChanged.connect(lambda s=session: self._queue_changed(s))
         session.queue.stateChanged.connect(lambda s=session: self._queue_changed(s))
         self.refresh_all()
 
     def remove_session(self, session: Session) -> None:
+        if session.is_workflow:
+            return
         idx = self._index_of(session)
         pane = self._panes.pop(session.id, None)
+        self._answers_open.discard(session.id)
         if idx >= 0:
             self.tabs.removeTab(idx)               # the tab bar selects a neighbouring tab by itself
         if pane is not None:
@@ -305,6 +356,7 @@ class WorkspaceView(QWidget):
         self.plus_button.setEnabled(s is not None)
         self.queue_button.setEnabled(s is not None)
         self.edit_button.setEnabled(s is not None)
+        self._sync_answers()
         if s is None:
             self.queue_button.setText(" Queue")
             self.title.setText("")
@@ -347,6 +399,64 @@ class WorkspaceView(QWidget):
             self.run_button.setObjectName("Primary")
         self.run_button.style().unpolish(self.run_button)
         self.run_button.style().polish(self.run_button)
+
+    # ------------------------------------------------------------------ predefined answers of the main process
+    def _sync_answers(self) -> None:
+        s = self.current_session()
+        self.clip_button.setEnabled(s is not None)
+        opened = s is not None and s.id in self._answers_open
+        self.clip_button.blockSignals(True)
+        self.clip_button.setChecked(opened)
+        self.clip_button.blockSignals(False)
+        self.answer_panel.setVisible(opened)
+        if s is None:
+            self.clip_button.setIcon(self._icons.icon("paperclip", theme.TEXT_MUTED, 18))
+            return
+        n = len(s.answers)
+        self.clip_button.setIcon(self._icons.icon("paperclip", ACCENT if n else theme.TEXT_MUTED, 18))
+        self.clip_button.setToolTip(f"Predefined answers ({n}) — click to show or hide" if n
+                                    else "Attach predefined answers (optional) — click to show or hide")
+        self.answers_edit.setEnabled(not s.is_running)
+        if self.answers_edit.text() != s.answers_text and not self.answers_edit.hasFocus():
+            self.answers_edit.setText(s.answers_text)
+        self.keep_box.blockSignals(True)
+        self.keep_box.setChecked(s.keep_answers)
+        self.keep_box.blockSignals(False)
+        answers = s.answers
+        if s.is_running and s.run_answer_count:
+            self.answer_hint.setText(f"{len(s.answers_sent)} of {s.run_answer_count} sent — the answers cannot be "
+                                     "changed while the script runs")
+        elif answers:
+            self.answer_hint.setText(f"{len(answers)} answer{'s' if len(answers) != 1 else ''}: " + " · ".join(answers)
+                                     + ("" if s.keep_answers else "  (this instance only)"))
+        else:
+            self.answer_hint.setText("No answers — the script asks you whenever it needs input.")
+
+    def _on_clip(self, checked: bool) -> None:
+        s = self.current_session()
+        if s is None:
+            return
+        (self._answers_open.add if checked else self._answers_open.discard)(s.id)
+        self.answer_panel.setVisible(checked)
+        if checked and self.answers_edit.isEnabled():
+            self.answers_edit.setFocus()
+
+    def _on_answers_edited(self, text: str) -> None:
+        s = self.current_session()
+        if s is not None and not s.set_answers(text):            # the script runs meanwhile: the run keeps its answers
+            self.answers_edit.setText(s.answers_text)
+
+    def _on_keep(self, keep: bool) -> None:
+        s = self.current_session()
+        if s is None:
+            return
+        error = s.set_keep_answers(keep)
+        if error:
+            self.answer_hint.setText(error)
+
+    def _on_answers_changed(self, session: Session) -> None:
+        if session is self.current_session():
+            self._sync_answers()
 
     # ------------------------------------------------------------------ actions
     def _run_or_stop(self) -> None:

@@ -10,10 +10,15 @@ Lifecycle
 * Must Execute on: the queue starts after any main exit, a failed cell never blocks later ones, and a cell
   that is *reliably* known to be blocked on stdin with no predefined answer left is stopped after 5 minutes.
 
-Every cell gets its own ProcessRunner (own pipes, own stdin routing, own stop handling) and its own stdin
-probe, so nothing of one cell can reach another cell or the main process.  The next cell is started only
-after the previous runner reported ``finished`` (the process has exited and its output has been delivered);
+Every tool cell and shell cell gets its own ProcessRunner (own pipes, own stdin routing, own stop handling) and
+its own stdin probe, so nothing of one cell can reach another cell or the main process.  The next cell is started
+only after the previous runner reported ``finished`` (the process has exited and its output has been delivered);
 a cell that was told to stop is waited for in exactly the same way.
+
+Python code cells are the exception on purpose: all of them run in ONE Python process per run (cell_kernel.py),
+so a variable defined by one cell is available to the later ones.  That process is started by the first Python
+code cell of a run and ended when the run ends - completed, stopped or failed - so no variable ever survives
+into the next run.  Tool cells and shell cells are separate programs and cannot see those variables.
 
 Input handling (details in stdin_watch.py / stdin_probe/sitecustomize.py)
 * Python processes (tool cells; ``python`` inside code cells) report blocking stdin reads, so answers are sent
@@ -26,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -35,11 +41,12 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from . import cell_kernel
 from .config import AppConfig
 from .process_manager import (ENTRY_NAME, IS_WINDOWS, LaunchError, ProcessRunner, describe_exit, plan_tool_launch,
                               resolve_interpreter)
 from .queue_model import (INPUT_TIMEOUT_REASON, LANG_PYTHON, LANG_SHELL, CellKind, CellStatus, QueueCell, QueueState)
-from .stdin_watch import StdinProbe
+from .stdin_watch import StdinProbe, advance_waits
 
 log = logging.getLogger(__name__)
 
@@ -72,25 +79,84 @@ def build_shell_command(text: str, workdir: Path, windows: bool | None = None) -
     return ShellPlan(f'"{comspec}" /d /s /c ""{script}""', "cmd.exe /c  (batch script, runs in the tool folder)", script)
 
 
-# Runs the cell's source in __main__ (so ``if __name__ == "__main__"`` works), with the tool folder as the
-# import root (``-c`` puts "" first on sys.path) and the real file name in tracebacks.
-_PY_BOOTSTRAP = ("import sys;p=sys.argv[1];sys.argv=[p]+sys.argv[2:];"
-                 "exec(compile(open(p,encoding='utf-8').read(),p,'exec'))")
+# Starts the shared session: runs cell_kernel.py (which must not become importable by user code, hence exec instead
+# of a path on sys.path) with the tool folder as the import root (``-c`` puts "" first on sys.path).
+KERNEL_PATH = Path(cell_kernel.__file__).resolve()
+_KERNEL_BOOTSTRAP = ("import sys;p=sys.argv[1];g={'__name__':'toolbox_cell_kernel','__file__':p};"
+                     "exec(compile(open(p,encoding='utf-8').read(),p,'exec'),g);g['main'](sys.argv[2],sys.argv[3])")
 
 
-def build_python_command(code: str, workdir: Path, interpreter: str) -> ShellPlan:
-    """A Python code cell: the text is saved as ``cell.py`` and run unbuffered by the tool's interpreter."""
-    script = Path(workdir) / "cell.py"
-    script.write_text(code.replace("\r\n", "\n"), encoding="utf-8", newline="\n")
-    return ShellPlan([interpreter, "-u", "-c", _PY_BOOTSTRAP, str(script)], "", script)
+def is_python_cell(cell: QueueCell) -> bool:
+    return cell.kind is CellKind.CODE and cell.language == LANG_PYTHON
+
+
+def _partial_marker_len(text: str, marker: str) -> int:
+    """Length of the longest tail of ``text`` that is the beginning of ``marker`` (it may be completed by the next chunk)."""
+    for k in range(min(len(marker) - 1, len(text)), 0, -1):
+        if text.endswith(marker[:k]):
+            return k
+    return 0
 
 
 # --------------------------------------------------------------------------- one run of one cell
+@dataclass
+class _Kernel:
+    """The shared Python process of one queue run (see cell_kernel.py)."""
+    runner: ProcessRunner
+    probe: StdinProbe                     # its folder is also the control folder (cell files, quit file)
+    token: str
+    number: int = 0                       # cells handed to it so far
+    current: "_Run | None" = None         # the cell being executed in it right now
+    last_cell: QueueCell | None = None    # where late output (a background thread) is shown
+    pending: str = ""                     # output held back because it may be the start of a completion marker
+    ending: bool = False                  # the queue asked it to quit
+    alive: bool = True
+
+    @property
+    def marker(self) -> str:
+        return f"{cell_kernel.MARK_PREFIX}{self.token}:"
+
+    def feed(self, text: str, final: bool = False) -> list[tuple[str, object]]:
+        """Split process output into ("text", str) and ("done", (cell number, exit code)) events.
+
+        The completion marker is removed from the text; a marker (or the start of one) split across two chunks
+        is held back until it is complete.  ``final``: the process is gone, release whatever is still held."""
+        events: list[tuple[str, object]] = []
+        buf, self.pending = self.pending + text, ""
+        marker = self.marker
+        while buf:
+            i = buf.find(marker)
+            if i < 0:
+                keep = 0 if final else _partial_marker_len(buf, marker)
+                if len(buf) > keep:
+                    events.append(("text", buf[:len(buf) - keep]))
+                self.pending = buf[len(buf) - keep:] if keep else ""
+                return events
+            if i:
+                events.append(("text", buf[:i]))
+            j = buf.find(cell_kernel.MARK_END, i + len(marker))
+            if j < 0:                                                   # marker not complete yet
+                if final:
+                    events.append(("text", buf[i:]))
+                else:
+                    self.pending = buf[i:]
+                return events
+            try:
+                number, code = (int(part) for part in buf[i + len(marker):j].split(":"))
+                events.append(("done", (number, code)))
+            except ValueError:
+                pass
+            buf = buf[j + 1:]
+        return events
+
+
 @dataclass
 class _Run:
     cell: QueueCell
     runner: ProcessRunner
     probe: StdinProbe
+    kernel: _Kernel | None = None        # set for a Python code cell: it runs in the shared session
+    number: int = 0                      # ... as this numbered cell of it
     # input flow
     seen: dict[str, float] = field(default_factory=dict)        # wait request -> first seen (monotonic)
     answered: dict[str, float] = field(default_factory=dict)    # wait request -> when we answered it
@@ -118,6 +184,7 @@ class SessionQueue(QObject):
     poll_ms = 100                        # how often the stdin probe is looked at while a cell runs
     answer_debounce_s = 0.3              # a wait must last this long before it counts (reads that return at once don't)
     prompt_quiet_s = 0.6                 # undetectable processes: an unfinished line must stay unchanged this long
+    kernel_exit_grace_s = 3.0            # how long the shared session may take to quit before it is stopped
 
     def __init__(self, session, config: AppConfig, tool_lookup: Callable[[str], object | None] | None = None):
         super().__init__(session)
@@ -133,6 +200,10 @@ class SessionQueue(QObject):
         self._user_stop = False
         self._advance_pending = False
         self._scope: set[str] | None = None        # ids of the cells of a manual run (None: every pending cell)
+        self._kernel: _Kernel | None = None        # the shared Python session of the run in progress
+        self._finishing: tuple[QueueState, str] | None = None   # the run is over; waiting for the session to exit
+        self._kernel_lost = False                  # the session died unexpectedly earlier in this run
+        self._settled_sent = False
         self.discarded = False
         self._poll = QTimer(self)
         self._poll.setInterval(self.poll_ms)
@@ -148,7 +219,7 @@ class SessionQueue(QObject):
     @property
     def busy(self) -> bool:
         """True while the queue is executing or one of its processes is still alive."""
-        return self._run is not None or self.executing
+        return self._run is not None or self.executing or self._kernel is not None
 
     @property
     def current_cell(self) -> QueueCell | None:
@@ -190,6 +261,8 @@ class SessionQueue(QObject):
         if s is QueueState.NOT_RUN:
             return self._detail
         if s is QueueState.WAITING:
+            if self.session.is_workflow:
+                return "Ready — press Run now, or a cell's play button"
             if self.session.is_running:
                 return "Waiting for the main process to finish"
             return "Waiting — starts when the main process finishes (it is not running now)"
@@ -326,6 +399,7 @@ class SessionQueue(QObject):
 
     def _begin(self, scope: set[str] | None = None) -> None:
         self._user_stop = False
+        self._kernel_lost = False
         self._scope = scope
         self._set_state(QueueState.EXECUTING)
         self._schedule_advance()
@@ -368,7 +442,8 @@ class SessionQueue(QObject):
 
     def _run_next(self) -> None:
         self._advance_pending = False
-        if self.discarded or self.state is not QueueState.EXECUTING or self._run is not None:
+        if (self.discarded or self.state is not QueueState.EXECUTING or self._run is not None
+                or self._finishing is not None):
             return                                               # duplicate trigger / shutting down: do nothing
         if self._user_stop:
             self._mark_rest(CellStatus.CANCELLED, "queue stopped by you")
@@ -383,6 +458,16 @@ class SessionQueue(QObject):
         self._start_cell(cell)
 
     def _finish(self, state: QueueState, detail: str) -> None:
+        """The run is over. Its Python session (and with it every variable) ends first; the queue is then
+        reported as finished, so "finished" always means that no process of the run is alive any more."""
+        if self._kernel is not None:
+            self._finishing = (state, detail)
+            self._end_kernel()
+            return
+        self._complete(state, detail)
+
+    def _complete(self, state: QueueState, detail: str) -> None:
+        self._finishing = None
         for c in self.cells:
             c.rearm()                                            # editable again; the result stays readable
         self._scope = None
@@ -406,7 +491,8 @@ class SessionQueue(QObject):
         self._emit(cell, "system", text + "\n")
 
     def _plan(self, cell: QueueCell, workdir: Path) -> tuple[list[str] | str, str, list[str]]:
-        """(argv, cwd, header lines) or LaunchError."""
+        """(argv, cwd, header lines) of a tool cell or a shell cell, or LaunchError. (Python code cells run in
+        the shared session instead, see _start_in_kernel.)"""
         if cell.kind is CellKind.TOOL:
             tool = self._lookup(cell.tool_id)
             if tool is None:
@@ -415,17 +501,6 @@ class SessionQueue(QObject):
             return argv, str(tool.path), [f"> {interp} -u {ENTRY_NAME}   ({'tool .venv' if source == 'venv' else 'global Python'})",
                                           f"  in {tool.path}"]
         cwd = str(self.session.tool.path)
-        if cell.language == LANG_PYTHON:
-            # The cell runs with the interpreter of the tool this queue belongs to (its .venv, else the global one).
-            interp, err, source = resolve_interpreter(self.session.tool.path, self._config.resolved_global_python())
-            if err is not None:
-                raise LaunchError(err)
-            try:
-                plan = build_python_command(cell.command, workdir, interp)
-            except OSError as exc:
-                raise LaunchError(f"Could not prepare the code: {exc}") from None
-            return plan.argv, cwd, [f"> {interp} -u   (Python code, {'tool .venv' if source == 'venv' else 'global Python'})",
-                                    f"  in {cwd}"]
         try:
             plan = build_shell_command(cell.command, workdir)
         except OSError as exc:
@@ -445,6 +520,9 @@ class SessionQueue(QObject):
         if cell.kind is CellKind.CODE and not cell.command.strip():
             self._system(cell, "(Empty cell — nothing to run.)")
             self._end_cell(cell, CellStatus.COMPLETED, "", 0)
+            return
+        if is_python_cell(cell):
+            self._start_in_kernel(cell)
             return
         probe = StdinProbe()
         runner = ProcessRunner(self)
@@ -476,6 +554,150 @@ class SessionQueue(QObject):
         self.cellChanged.emit(cell)
         self.stateChanged.emit()
         self._poll.start(self.poll_ms)
+
+    # ------------------------------------------------------------------ the shared Python session
+    def _start_in_kernel(self, cell: QueueCell) -> None:
+        """Run a Python code cell in the session of this run (started by the first such cell)."""
+        try:
+            # The session uses the interpreter of the tool this queue belongs to (its .venv, else the global one).
+            interp, err, source = resolve_interpreter(self.session.tool.path, self._config.resolved_global_python())
+            if err is not None:
+                raise LaunchError(err)
+            cwd = str(self.session.tool.path)
+            self._system(cell, f"> {interp} -u   (Python code, {'tool .venv' if source == 'venv' else 'global Python'})")
+            self._system(cell, f"  in {cwd}")
+            self._system(cell, "  variables are shared with the other Python code cells of this run and are gone "
+                               "when the run ends")
+            if self._kernel_lost and self._kernel is None:
+                self._system(cell, "  (the Python session ended unexpectedly earlier in this run: this is a fresh "
+                                   "one, earlier variables are gone)")
+            kernel = self._kernel or self._launch_kernel(interp, cwd)
+            number = kernel.number + 1
+            control = Path(kernel.probe.dir)
+            try:                                  # written under another name first, so it is never read half written
+                (control / f"run-{number}.tmp").write_text(cell.command.replace("\r\n", "\n"), encoding="utf-8",
+                                                           newline="\n")
+                os.replace(control / f"run-{number}.tmp", control / (cell_kernel.RUN_FILE % number))
+            except OSError as exc:
+                raise LaunchError(f"Could not prepare the code: {exc}") from None
+        except LaunchError as exc:
+            log.warning("Python cell could not start: %s", exc)
+            self._emit(cell, "stderr", f"Could not start this cell:\n{exc}\n")
+            self._end_cell(cell, CellStatus.FAILED, f"could not start: {str(exc).splitlines()[0]}", None)
+            return
+        except Exception as exc:                                  # never let one cell take the queue down
+            log.exception("Unexpected failure while starting a Python cell")
+            self._emit(cell, "stderr", f"Unexpected error while starting this cell: {exc}\n")
+            self._end_cell(cell, CellStatus.FAILED, f"could not start: {exc}", None)
+            return
+        kernel.number = number
+        run = _Run(cell, kernel.runner, kernel.probe, kernel=kernel, number=number, last_output=time.monotonic())
+        kernel.current = run
+        kernel.last_cell = cell
+        cell.pid = kernel.runner.pid
+        self._run = run
+        self.cellChanged.emit(cell)
+        self.stateChanged.emit()
+        self._poll.start(self.poll_ms)
+
+    def _launch_kernel(self, interp: str, cwd: str) -> _Kernel:
+        probe = StdinProbe()
+        runner = ProcessRunner(self)
+        runner.merge_stderr = self.merge_output
+        kernel = _Kernel(runner, probe, secrets.token_hex(6))
+        runner.output.connect(lambda kind, text, k=kernel: self._on_kernel_output(k, kind, text))
+        runner.finished.connect(lambda code, stopped, k=kernel: self._on_kernel_finished(k, code, stopped))
+        try:
+            runner.start([interp, "-u", "-c", _KERNEL_BOOTSTRAP, str(KERNEL_PATH), str(probe.dir), kernel.token],
+                         cwd, probe.env())
+        except Exception:
+            probe.close()
+            runner.deleteLater()
+            raise
+        self._kernel = kernel
+        self._kernel_lost = False
+        return kernel
+
+    def _on_kernel_output(self, kernel: _Kernel, kind: str, text: str) -> None:
+        events = kernel.feed(text) if kind == "stdout" else [("text", text)]
+        for what, value in events:
+            if what == "text":
+                self._kernel_text(kernel, kind, value)
+            else:
+                self._on_kernel_cell_done(kernel, *value)
+
+    def _kernel_text(self, kernel: _Kernel, kind: str, text: str) -> None:
+        run = kernel.current
+        if run is not None and run is self._run:
+            self._on_output(run, kind, text)
+        elif kernel.last_cell is not None:                        # e.g. a background thread printing after its cell
+            self._emit(kernel.last_cell, kind, text)
+
+    def _on_kernel_cell_done(self, kernel: _Kernel, number: int, code: int) -> None:
+        run = kernel.current
+        if run is None or run is not self._run or run.number != number:
+            return                                                # stale / duplicate: never concludes a cell twice
+        kernel.current = None
+        self._conclude(run, code, False)
+
+    def _on_kernel_finished(self, kernel: _Kernel, code, stopped: bool) -> None:
+        """The session process is gone: at the end of a run (expected), or because something killed it."""
+        if not kernel.alive:
+            return
+        kernel.alive = False
+        if self._kernel is kernel:
+            self._kernel = None
+        for what, value in kernel.feed("", final=True):           # release output still held back
+            if what == "text":
+                self._kernel_text(kernel, "stdout", value)
+        run, kernel.current = kernel.current, None
+        kernel.probe.close()
+        kernel.runner.deleteLater()
+        unexpected = not kernel.ending
+        if unexpected and not self.discarded:
+            self._kernel_lost = True
+        if run is not None and run is self._run:
+            cell = run.cell
+            if not (self._user_stop or cell.timed_out or self.discarded):
+                self._system(cell, "(The Python session ended with this cell — its variables are gone.)")
+            self._conclude(run, code, stopped)                    # the cell's result; may advance or finish the queue
+        elif unexpected and not (self._user_stop or self.discarded) and kernel.last_cell is not None:
+            self._system(kernel.last_cell, "(The Python session ended unexpectedly — its variables are gone.)")
+        if self._finishing is not None:
+            state, detail = self._finishing
+            self._finishing = None
+            if not self.discarded:
+                self._complete(state, detail)
+        if self.discarded:
+            self._maybe_settled()
+
+    def _end_kernel(self) -> None:
+        """Ask the session to quit; if it has not done so shortly (a non-daemon thread of user code, say) stop it."""
+        kernel = self._kernel
+        if kernel is None or kernel.ending:
+            return
+        kernel.ending = True
+        try:
+            (Path(kernel.probe.dir) / cell_kernel.QUIT_FILE).write_bytes(b"")
+        except OSError:
+            kernel.runner.force_stop()
+            return
+        QTimer.singleShot(int(self.kernel_exit_grace_s * 1000),
+                          lambda k=kernel: k.runner.force_stop() if k.alive else None)
+
+    def _live_runners(self) -> list[ProcessRunner]:
+        runners = []
+        if self._run is not None:
+            runners.append(self._run.runner)
+        if self._kernel is not None and self._kernel.alive and self._kernel.runner not in runners:
+            runners.append(self._kernel.runner)
+        return runners
+
+    def _maybe_settled(self) -> None:
+        """After discard(): announce (once) that nothing of this queue is alive any more."""
+        if self.discarded and self._run is None and self._kernel is None and not self._settled_sent:
+            self._settled_sent = True
+            self.settled.emit()
 
     # ------------------------------------------------------------------ output + interactive input
     def _on_output(self, run: _Run, kind: str, text: str) -> None:
@@ -538,21 +760,8 @@ class SessionQueue(QObject):
 
     def _probe_flow(self, run: _Run, waits: frozenset[str], now: float) -> bool:
         """Reliable path. Returns True while a stdin request exists that no predefined answer can satisfy."""
-        for table in (run.seen, run.answered, run.unsatisfied):
-            for key in [k for k in table if k not in waits]:
-                del table[key]                                    # that read returned
-        for key in waits:
-            run.seen.setdefault(key, now)
-        for key, first in sorted(run.seen.items(), key=lambda kv: kv[1]):
-            if now - first < self.answer_debounce_s:
-                continue                                          # a read that returns at once is not a wait
-            if key not in run.answered:
-                if self._send_next_answer(run):
-                    run.answered[key] = now
-                else:
-                    run.unsatisfied.setdefault(key, now)
-            elif now - run.answered[key] >= self.answer_debounce_s:
-                run.unsatisfied.setdefault(key, now)              # still blocked after its answer: needs more
+        advance_waits(run.seen, run.answered, run.unsatisfied, waits, now, self.answer_debounce_s,
+                      lambda: self._send_next_answer(run))
         if run.unsatisfied and not run.exhausted_noted:
             run.exhausted_noted = True
             tail = ("It is stopped after 5 minutes without input (Must Execute)." if self.must_execute
@@ -569,19 +778,29 @@ class SessionQueue(QObject):
     def _time_out(self, run: _Run) -> None:
         cell = run.cell
         cell.timed_out = True
-        self._system(cell, "✖ No input for 5 minutes — stopping this cell.")
-        run.runner.request_stop()
+        if run.kernel is not None:
+            # A read blocked on a pipe cannot be interrupted reliably on every platform, so the session is ended.
+            self._system(cell, "✖ No input for 5 minutes — stopping this cell (its Python session ends, variables "
+                               "are lost).")
+            run.runner.force_stop()
+        else:
+            self._system(cell, "✖ No input for 5 minutes — stopping this cell.")
+            run.runner.request_stop()
         self.cellChanged.emit(cell)
 
     # ------------------------------------------------------------------ finishing a cell
     def _on_cell_finished(self, run: _Run, code, stopped: bool) -> None:
         if run is not self._run:
             return                                                # duplicate / stale event: never advances twice
+        run.probe.close()
+        run.runner.deleteLater()
+        self._conclude(run, code, stopped)
+
+    def _conclude(self, run: _Run, code, stopped: bool) -> None:
+        """Record how a cell ended (its process, or for a Python cell its turn in the shared session, is over)."""
         self._poll.stop()
         self._run = None
         cell = run.cell
-        run.probe.close()
-        run.runner.deleteLater()
         remaining = cell.answers[len(cell.answers_sent):]
         if remaining:
             cell.unused_answers = remaining
@@ -606,7 +825,7 @@ class SessionQueue(QObject):
         self.cellChanged.emit(cell)
         self.stateChanged.emit()
         if self.discarded:
-            self.settled.emit()
+            self._maybe_settled()
             return
         if self._user_stop:
             self._schedule_advance()                              # _run_next cancels the rest and finishes
@@ -627,7 +846,11 @@ class SessionQueue(QObject):
         self._user_stop = True
         run = self._run
         if run is None:
-            self._schedule_advance()
+            kernel = self._kernel
+            if kernel is not None and kernel.ending:
+                kernel.runner.force_stop()                        # the run is over, only its session is still quitting
+            else:
+                self._schedule_advance()
             return
         if run.runner.stop_requested:
             run.runner.force_stop()
@@ -649,16 +872,17 @@ class SessionQueue(QObject):
         """The session is being closed: nothing may start any more; a live cell is stopped."""
         self.discarded = True
         self._poll.stop()
-        run = self._run
-        if run is None:
-            self.settled.emit()
+        runners = self._live_runners()
+        if not runners:
+            self._maybe_settled()
             return
-        run.runner.interrupt_grace = min(run.runner.interrupt_grace, 2.0)
-        run.runner.request_stop()
+        for runner in runners:
+            runner.interrupt_grace = min(runner.interrupt_grace, 2.0)
+            runner.request_stop()
 
     def kill_now(self) -> None:
         """Application exit: kill the running cell's process tree immediately."""
         self.discarded = True
         self._poll.stop()
-        if self._run is not None:
-            self._run.runner.kill_now()
+        for runner in self._live_runners():
+            runner.kill_now()

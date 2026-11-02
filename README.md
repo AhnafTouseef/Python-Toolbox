@@ -110,6 +110,16 @@ terminal, a stdin field and Clear.
   then (~2 s later) kills the whole process tree. While stopping, the button becomes **Force
   stop** to skip the wait. Intentional stops show *Stopped*, not *Failed*.
 * **Clear** only clears the display.
+* **Predefined answers (paperclip).** For a tool you run again and again, the **paperclip** in the instance's
+  title bar opens an answers field, exactly like a queue cell's paperclip: type the answers in order
+  (`1920, 1080, yes`) and each run types one in whenever the script really blocks on `input()`, one answer per
+  question, shown in the terminal as if typed. The **Keep for this tool** check mark decides how long they live:
+  unticked, the answers belong to this instance only; ticked, they are saved (`"tool_answers"` in `config.json`,
+  by tool id) and every new instance of that tool starts with them - edits are saved while the box is ticked,
+  unticking forgets the saved set (this instance keeps its text). Answers that run out leave the rest of the
+  questions to you (the input line works as usual); answers a run did not need are listed as *Not used*. They
+  are frozen while the script runs, apply to the main process only, and a run without answers is launched exactly as
+  before (the stdin probe is only attached when answers exist). The paperclip is blue when answers are set.
 * Closing the application with running processes asks, then stops them.
 
 **System tray and notifications.** The window's close button sends the window to the system tray instead of
@@ -126,6 +136,23 @@ as before and no notifications are shown.
 library (about one third of the window, 300–460 px) listing each running instance. Click an
 item to jump to that exact tab; close with ✕, Esc or by clicking outside. It never affects
 processes or the grid underneath.
+
+## Workflows
+
+The **Workflows** button in the library header opens a page that is the queue panel on its own, full screen, with
+no tool behind it. A workflow is a queue that does not wait for a main process: it runs when you press **Run now**
+(or a cell's play button / *run from this cell*). Everything else is the queue below: Python, shell and tool cells,
+variables shared during a run, predefined answers, Must Execute, *Save as preset* / *Presets…*, Stop.
+
+* Several workflows can be open as tabs (`+` adds one, ✕ closes one, double-click closes without asking). A
+  workflow lives while the Toolbox is open, like a queue; closing it (or quitting) discards its cells, so the ✕ asks
+  first when it has cells - **Save as preset** keeps them.
+* Cells run in the workflow's **working folder** (the **Folder…** button; default `workflows/` next to
+  `config.json`, created on demand; not changeable while something runs). The interpreter rule is the tool rule:
+  a `.venv` in that folder if it has one (a broken one is an error, never a silent fallback), otherwise the global
+  Python. Tool cells run their tool in the tool's own folder, as in a queue.
+* A running workflow counts as running: it shows in **Active** (clicking it opens its page), in the quit warning,
+  and finishes with a notification like a finished queue.
 
 ## Sequential execution queue
 
@@ -146,7 +173,9 @@ the main process has **exited**.
   above the first cell), so a cell can be inserted anywhere between two others.
   *Code cell* - its code is edited right in the card. The language selector defaults to **Python**: the code is run
   by the tool's interpreter (its `.venv`, otherwise the global Python) in the tool's folder, exactly like a script
-  (`__name__ == "__main__"`, the tool folder is importable, tracebacks show the source line). **Shell** runs the
+  (`__name__ == "__main__"`, the tool folder is importable, tracebacks show the source line). **Python cells of one
+  run share their variables**: a variable, import, function or class defined in one cell is there in the next
+  Python cells (see *Shared variables* below). **Shell** runs the
   text as a command / batch script instead (Windows: `cmd.exe`; elsewhere `/bin/sh`). An empty cell completes at
   once without starting a process. *Tool cell* - any tool in `tools/`, launched through the same code as the Run
   button (a `.venv` without an interpreter is an error, never a silent fallback); the pencil button changes the tool.
@@ -157,8 +186,18 @@ the main process has **exited**.
   the first failed cell and marks the later ones *Skipped*. *Must Execute on*: it runs after any exit (including a
   main process that could not even be launched), and a failed cell never blocks the next one.
 * **Strictly sequential.** One cell at a time, in the displayed order; the next one starts only after the previous
-  process has exited and its output was delivered. Each cell has its own process, pipes, output and result; its
-  input never reaches the main process or another cell.
+  process has exited and its output was delivered. Each tool and shell cell has its own process, pipes, output and
+  result; its input never reaches the main process or another cell. (Python code cells run in one shared Python
+  session per run, see below; they still have their own output, result and input.)
+* **Shared variables.** All Python code cells of a run are executed by one Python process, in one namespace, so
+  `x = 20` in one cell lets a later cell use `x`, including across a tool or shell cell in between. The session
+  belongs to the *run*, not to the queue: it starts with the first Python cell and ends when the run completes,
+  is stopped or fails, so no variable ever survives into the next run. The play button on a single cell and
+  *run from this cell* are runs of their own and start with nothing defined. Details: an exception or
+  `sys.exit()` ends only that cell and the variables stay for the rest of the run (so a Must Execute clean-up cell
+  can still use them); if the session process itself dies (`os._exit`, a native crash), that cell fails and the
+  next Python cell starts a fresh session, saying so in its output; Stop and the input timeout end the session
+  with the cell. Tool cells, shell cells and the main process are separate programs and cannot see the variables.
 * **Output and input below the cell.** Each cell shows what it printed in its own output area directly under
   it (the **Output** button hides it). While a cell runs, an input line sits right below that output, like
   `input()` in Jupyter: when the cell waits for input the line is highlighted and focused, type and press Enter.
@@ -231,8 +270,8 @@ Scripts run through pipes, not a real console:
 
 ## Configuration
 
-`config.json` (next to `app.py`): `{ "global_python": null, "tool_paths": [], "pinned": [], "notifications": true }`. `null` = the interpreter running
-the toolbox; `tool_paths` = extra folders to look for tools in (managed by the folder button in the library); `pinned` = pinned tool ids; `notifications` = desktop notifications on/off.
+`config.json` (next to `app.py`): `{ "global_python": null, "tool_paths": [], "pinned": [], "notifications": true, "tool_answers": {} }`. `null` = the interpreter running
+the toolbox; `tool_paths` = extra folders to look for tools in (managed by the folder button in the library); `pinned` = pinned tool ids; `notifications` = desktop notifications on/off; `tool_answers` = predefined answers kept per tool id (the *Keep for this tool* check mark).
 
 ## Tests
 
@@ -242,7 +281,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-330 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+398 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output
@@ -288,13 +327,15 @@ app/
   slide_drawer.py           shared overlay behaviour (layer, sliding panel, scrim, Esc)
   active_process_drawer.py  right-side overlay listing running instances
   queue_model.py            queue cells, statuses, answer parsing - no Qt
-  session_queue.py          the sequential engine: Must Execute, answers, input timeout
+  session_queue.py          the sequential engine: Must Execute, answers, input timeout, the shared session
+  cell_kernel.py            the shared Python session (runs inside the tool's interpreter; stdlib only)
   stdin_watch.py            Toolbox side of input detection (marker folder)
   stdin_probe/              sitecustomize.py injected into queued Python processes - nothing else may live here
   queue_drawer.py           queue drawer: notebook-style cells, insert bars, inline code/output/input, switch
   queue_dialogs.py          searchable tool picker, save-preset and presets dialogs
   presets.py                global queue presets (JSON files in presets/) - no Qt
   tool_folders.py           dialog to add / remove extra tool folders
+  workflow_view.py          the Workflows page: tabs + the queue panel docked full screen (no tool)
   tray.py                   system tray icon + menu, desktop notifications
   editor.py                 open a tool's main.py in the system editor
   gc_guard.py               keeps Python's GC on the GUI thread (see source)
@@ -313,5 +354,5 @@ script in `input()`, a `time.sleep()` loop, and one that spawns a child process.
 
 The queue's Windows-specific parts are also untested on a real Windows machine: Shell code cells run through a
 generated `.cmd` file (`cmd.exe /d /s /c ""file""`, covered only by a test of the command line and file content),
-and a timed-out cell is stopped through the same Ctrl+C/taskkill path as Stop. Python code cells use the same path as tool cells (the interpreter is started directly with a generated `.py`). Please try a Shell cell with a
+and a timed-out cell is stopped through the same Ctrl+C/taskkill path as Stop. Python code cells use the same path as tool cells (the interpreter is started directly, once per run, to host the shared session). Please try a Shell cell with a
 quoted path, a Python code cell with `input()`, a Python tool cell with `input()` and predefined answers, and a short timeout trial.
