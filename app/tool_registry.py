@@ -19,23 +19,32 @@ from .icon_manager import IconManager
 log = logging.getLogger(__name__)
 
 ENTRY_NAME = "main.py"
+WORKFLOWS_ID = "workflow:all"       # the id of the library's Workflows card (workflow sessions use "workflow:<n>")
 
 
 @dataclass
 class ToolInfo:
-    id: str                       # built-in tools/: the directory name; added folders: the full directory path
+    id: str                       # the folder name; the full folder path when an earlier folder already has that name
     path: Path                    # tool directory (subprocess working directory)
     meta: tm.ToolMetadata
     extras: dict = field(default_factory=dict)
     issues: list[str] = field(default_factory=list)
-    root: Path | None = None      # the folder that was scanned to find it (tools/ or an added folder)
-    root_index: int = 0           # 0 = the built-in tools/ folder ("Path 1"), then the added folders in order
+    root: Path | None = None      # the folder that was scanned to find it
+    root_index: int = 0           # its place in the folder list (0 = "Path 1")
     tag: str = ""                 # "Path 2 · MyTools" - only set while another tool has the same name
     pinned: bool = False          # pinned tools are listed first in the library
+    kind: str = "tool"            # "workflow" only for the library's Workflows card (not a tool: no pin / settings)
 
     @property
     def entry(self) -> Path:
         return self.path / ENTRY_NAME
+
+
+def workflows_card_info() -> ToolInfo:
+    """The stand-in the library shows as its first, neutral card. It is not part of the registry."""
+    meta = tm.ToolMetadata("Workflows", "Queues of code and tool cells that run on their own, without a tool.",
+                           "workflow", "#8E929C")
+    return ToolInfo(WORKFLOWS_ID, Path(""), meta, kind="workflow")
 
 
 def discover_tool_dirs(tools_dir: Path) -> list[Path]:
@@ -77,11 +86,10 @@ def norm_path(p: Path | str) -> str:
 class ToolRegistry(QObject):
     metadataChanged = Signal(str)          # tool id
 
-    def __init__(self, tools_dir: Path, icons: IconManager, extra_dirs: list[Path] | list[str] | tuple = (),
+    def __init__(self, icons: IconManager, dirs: list[Path] | list[str] | tuple = (),
                  parent: QObject | None = None, pinned: list[str] | tuple = ()):
         super().__init__(parent)
-        self.tools_dir = Path(tools_dir)
-        self.extra_dirs: list[Path] = [Path(d) for d in extra_dirs]
+        self.dirs: list[Path] = [Path(d) for d in dirs]       # the folders the user set; nothing is built in
         self.icons = icons
         self.tools: list[ToolInfo] = []
         self.by_id: dict[str, ToolInfo] = {}
@@ -101,11 +109,11 @@ class ToolRegistry(QObject):
     # ------------------------------------------------------------------ folders
     @property
     def roots(self) -> list[Path]:
-        """Path 1 is the application's own tools/ folder; the folders the user added follow in order."""
-        return [self.tools_dir, *self.extra_dirs]
+        """The folders tools are looked for in, in the order the user listed them (Path 1, Path 2, ...)."""
+        return list(self.dirs)
 
-    def set_extra_dirs(self, dirs) -> None:
-        self.extra_dirs = [Path(d) for d in dirs]
+    def set_dirs(self, dirs) -> None:
+        self.dirs = [Path(d) for d in dirs]
 
     def root_label(self, index: int) -> str:
         roots = self.roots
@@ -117,15 +125,12 @@ class ToolRegistry(QObject):
         """(Re)discover tools in every folder. Tools that are still there keep their ToolInfo object (open
         instances and library cards point at it); new ones are added and vanished ones are dropped."""
         issues: list[str] = []
-        try:
-            self.tools_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            issues.append(f"Could not create the tools folder {self.tools_dir}: {exc}")
         old = self.by_id
         found: list[tuple[str, Path, int]] = []             # (id, dir, root index)
         seen: set[str] = set()
+        names: set[str] = set()
         for index, root in enumerate(self.roots):
-            if index > 0 and not root.is_dir():
+            if not root.is_dir():
                 issues.append(f"Tool folder not found: {root}")
                 continue
             for d in discover_tool_dirs(root):
@@ -133,7 +138,9 @@ class ToolRegistry(QObject):
                 if key in seen:                              # the same tool reached through two overlapping folders
                     continue
                 seen.add(key)
-                found.append((d.name if index == 0 else str(d), d, index))
+                tid = d.name if d.name.casefold() not in names else str(d)    # the first folder keeps the plain name
+                names.add(d.name.casefold())
+                found.append((tid, d, index))
         tools: list[ToolInfo] = []
         changed: list[str] = []
         for tid, d, index in found:
@@ -184,8 +191,8 @@ class ToolRegistry(QObject):
         return self.by_id.get(tool_id)
 
     def resolve(self, folder_name: str, source: str = "") -> ToolInfo | None:
-        """Find a tool by its folder name (and, preferably, the folder it was found in; "" = the built-in tools/).
-        Used for presets, which must keep working on another PC where the added folders live elsewhere."""
+        """Find a tool by its folder name (and, preferably, the folder it was found in).
+        Used for presets, which must keep working on another PC where the folders live elsewhere."""
         same = [t for t in self.tools if t.path.name == folder_name]
         if not same:
             same = [t for t in self.tools if t.path.name.casefold() == folder_name.casefold()]
@@ -195,15 +202,11 @@ class ToolRegistry(QObject):
             for t in same:
                 if t.root is not None and norm_path(t.root) == norm_path(source):
                     return t
-        elif source == "":
-            for t in same:
-                if t.root_index == 0:
-                    return t
         return same[0]
 
     def source_of(self, tool: ToolInfo) -> str:
-        """What a preset stores to find the tool again: "" for the built-in tools/ folder, else the folder path."""
-        return "" if tool.root_index == 0 or tool.root is None else str(tool.root)
+        """What a preset stores to find the tool again: the folder it was found in."""
+        return "" if tool.root is None else str(tool.root)
 
     def update_metadata(self, tool_id: str, new_meta: tm.ToolMetadata) -> tuple[bool, str]:
         """Validate and save. Returns (ok, error message). Memory is updated only after a successful save."""

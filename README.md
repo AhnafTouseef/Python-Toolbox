@@ -22,13 +22,11 @@ Requires Python 3.10+ (3.13 was used for development). The toolbox's own depende
 only `PySide6`; it is **separate** from your tools' dependencies, which it never installs
 or manages. Use `pythonw app.py` if you do not want a console window.
 
-Put tools in the `tools/` folder next to `app.py`:
+No tool folder is built in: you choose where your tools live (see *Tool folders* below). Until you add one, the
+library shows only the **Workflows** card and a message pointing at the folder button. A tool folder looks like this:
 
 ```text
-PythonToolbox/
-├── app.py
-├── config.json              (created on first run)
-└── tools/
+MyScripts/                   <- any folder you add as a tool folder
     ├── VideoProcessor/
     │   ├── main.py          <- required: this is what makes it a tool
     │   ├── tool.json        <- created/managed by the toolbox
@@ -41,10 +39,10 @@ Tools are discovered at start-up and whenever you press **Refresh** (the circula
 **F5**): new, removed and edited tools show up without restarting. Open instances are never touched by a refresh
 (an instance of a tool whose folder was deleted keeps its output; running it again reports the missing folder).
 
-**More tool folders.** You do not have to move your tools into `tools/`. The folder button next to Refresh opens
-**Tool folders**: add any number of folders, each holding tool folders (a folder with a `main.py`) exactly like
-`tools/` does. `tools/` is **Path 1** and always stays; added folders are Path 2, 3, ... in the order listed and are
-stored in `config.json` (`"tool_paths": ["D:/MyScripts", ...]`). A folder that is itself a tool is refused (add its
+**Tool folders.** The folder button next to Refresh opens **Tool folders**: add any number of folders, each holding
+tool folders (a folder with a `main.py`). They are **Path 1, 2, 3, ...** in the order listed, any of them can be
+removed, and they are stored in `config.json` (`"tool_paths": ["D:/MyScripts", ...]`). A tool's id (used for pins and
+predefined answers) is its folder name, or its full path when an earlier folder already has a tool of that name. A folder that is itself a tool is refused (add its
 parent), a folder that disappears is reported and skipped, and a tool reachable through two overlapping folders
 is listed once. If two tools have the same name, both are kept and their cards (and queue pickers, and tab
 labels) carry a small tag naming the path they come from, e.g. `Path 2 · MyScripts`; the tag disappears when the
@@ -139,7 +137,8 @@ processes or the grid underneath.
 
 ## Workflows
 
-The **Workflows** button in the library header opens a page that is the queue panel on its own, full screen, with
+The **Workflows** card - always the first card of the library, in a neutral gray, even when no tool folder is set -
+opens a page that is the queue panel on its own, full screen, with
 no tool behind it. A workflow is a queue that does not wait for a main process: it runs when you press **Run now**
 (or a cell's play button / *run from this cell*). Everything else is the queue below: Python, shell and tool cells,
 variables shared during a run, predefined answers, Must Execute, *Save as preset* / *Presets…*, Stop.
@@ -177,9 +176,9 @@ the main process has **exited**.
   run share their variables**: a variable, import, function or class defined in one cell is there in the next
   Python cells (see *Shared variables* below). **Shell** runs the
   text as a command / batch script instead (Windows: `cmd.exe`; elsewhere `/bin/sh`). An empty cell completes at
-  once without starting a process. *Tool cell* - any tool in `tools/`, launched through the same code as the Run
+  once without starting a process. *Tool cell* - any tool of your tool folders, launched through the same code as the Run
   button (a `.venv` without an interpreter is an error, never a silent fallback); the pencil button changes the tool.
-  Adding or editing a cell never runs anything.
+  Adding or editing a cell never runs anything. The cell list's scrollbar is always shown (even with few or no cells), so cards keep their width while you delete cells quickly.
 * **When it starts.** Only on the real exit event of the main process, never from output silence or timing.
   *Must Execute off*: the queue runs only if the main process exited with code 0 and was not stopped by you;
   otherwise the cells are kept untouched (state "not run") and run after the next successful run. It then stops at
@@ -281,7 +280,7 @@ set QT_QPA_PLATFORM=offscreen
 python -m unittest discover -s tests -t .
 ```
 
-398 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
+411 tests cover discovery, metadata repair, colours, lazy rendering under scrolling and
 resizing, settings/colour/icon dialogs, real child processes (stdin, working directory,
 Unicode, large output, interrupt → terminate → kill, process trees, stubborn scripts,
 ordering of stdout/stderr), tabs, closing rules, the drawer, and resizing while output

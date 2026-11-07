@@ -18,7 +18,7 @@ from .session_manager import Session, SessionManager
 from .editor import open_in_editor
 from .presets import PresetStore
 from .tool_folders import ToolFoldersDialog
-from .tool_registry import ToolRegistry
+from .tool_registry import WORKFLOWS_ID, ToolRegistry
 from .tool_settings import ToolSettingsDialog
 from .workflow_view import WorkflowView
 from .workspace_view import WorkspaceView
@@ -79,7 +79,6 @@ class MainWindow(QMainWindow):
         self.library.activeRequested.connect(self.drawer.open_drawer)
         self.library.refreshRequested.connect(self.refresh_tools)
         self.library.foldersRequested.connect(self.open_tool_folders)
-        self.library.workflowsRequested.connect(self.open_workflows)
         self.workflows.backRequested.connect(self.show_library)
         self.workflows.newRequested.connect(self.new_workflow)
         self.workflows.closeRequested.connect(self.close_workflow)
@@ -131,7 +130,11 @@ class MainWindow(QMainWindow):
             (pane.input if pane.input.isEnabled() else self.workspace.run_button).setFocus()
 
     def open_tool(self, tool_id: str) -> None:
-        """Library card clicked: go to the tool's most recently active instance, or open a first one."""
+        """Library card clicked: go to the tool's most recently active instance, or open a first one.
+        The Workflows card opens the most recent workflow instead."""
+        if tool_id == WORKFLOWS_ID:
+            self.open_workflows()
+            return
         s = self.manager.most_recent(tool_id)
         if s is None:
             try:
@@ -153,7 +156,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ workflows
     def open_workflows(self) -> None:
-        """The library's Workflows button: the most recent workflow, or a first one."""
+        """The library's Workflows card: the most recent workflow, or a first one."""
         flows = self.manager.workflows()
         s = max(flows, key=lambda w: w.last_active) if flows else self.manager.create_workflow()
         self.show_session(s)
@@ -237,7 +240,7 @@ class MainWindow(QMainWindow):
             log.warning("Tool notices:\n%s", "\n".join(self.registry.issues))
 
     def open_tool_folders(self) -> None:
-        dlg = ToolFoldersDialog(self.registry.tools_dir, self.config.tool_paths, self.icons, self)
+        dlg = ToolFoldersDialog(self.config.tool_paths, self.icons, self)
         try:
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -253,7 +256,7 @@ class MainWindow(QMainWindow):
             self.config.tool_paths = old
             QMessageBox.warning(self, "Could not save", f"{error}\nThe folder list was not changed.")
             return
-        self.registry.set_extra_dirs(new)
+        self.registry.set_dirs(new)
         self.refresh_tools()
 
     # ------------------------------------------------------------------ pinning / editor
@@ -297,7 +300,7 @@ class MainWindow(QMainWindow):
         self._after_session_event(session.tool_id)
 
     def _after_session_event(self, tool_id: str) -> None:
-        self.library.refresh_status(tool_id)
+        self.library.refresh_status(WORKFLOWS_ID if tool_id.startswith("workflow:") else tool_id)
         self.library.set_active_count(len(self.manager.running()))
 
     # ------------------------------------------------------------------ quitting

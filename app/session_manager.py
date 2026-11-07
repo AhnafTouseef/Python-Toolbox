@@ -26,7 +26,7 @@ from .queue_model import parse_answers
 from .session_queue import SessionQueue
 from .stdin_watch import StdinProbe, advance_waits
 from .tool_metadata import ToolMetadata
-from .tool_registry import ToolInfo, ToolRegistry
+from .tool_registry import WORKFLOWS_ID, ToolInfo, ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -397,7 +397,7 @@ class SessionManager(QObject):
 
     def tool_status(self, tool_id: str) -> tuple[str | None, int]:
         """What a library card shows: running (with count) wins; otherwise the latest finished outcome."""
-        mine = self.for_tool(tool_id)
+        mine = self.workflows() if tool_id == WORKFLOWS_ID else self.for_tool(tool_id)   # the Workflows card sums them all
         n = sum(1 for s in mine if s.is_active)
         if n:
             return SessionStatus.RUNNING.value, n

@@ -213,6 +213,7 @@ class ToolCard(QWidget):
         super().__init__(parent)
         self.tool = tool
         self._icons = icons
+        self._plain = tool.kind == "workflow"      # the Workflows card: no pin, no settings, no editor
         self._hover = 0.0
         self._anim: QVariantAnimation | None = None
         self._pressed = False
@@ -266,7 +267,7 @@ class ToolCard(QWidget):
         self._tag.set_text(self.tool.tag)
         self._place_tag()
         self.apply_pin()
-        self.setToolTip(f"{m.name}\n{self.tool.path}")
+        self.setToolTip(m.name if self._plain else f"{m.name}\n{self.tool.path}")
         self.setAccessibleName(m.name)
         self.setAccessibleDescription(m.description)
         self.update()
@@ -274,6 +275,10 @@ class ToolCard(QWidget):
     def apply_pin(self) -> None:
         """The pin shows while the tool is pinned, and on hover (to pin it)."""
         pinned = self.tool.pinned
+        if self._plain:
+            self._pin.hide()
+            self._btn.hide()
+            return
         self._pin.setIcon(self._icons.icon("pin", theme.INFO if pinned else theme.TEXT_MUTED, 16))
         self._pin.setToolTip("Unpin from the top" if pinned else "Pin to the top of the library")
         self._pin.setAccessibleName("Unpin tool" if pinned else "Pin tool")
@@ -306,7 +311,8 @@ class ToolCard(QWidget):
         self._btn.move(body_x + body_w - 10 - 28, body_y + 8)
         self._pin.move(self._btn.x() - 26, body_y + 8)
         left = body_x + 14 + IconTile.SIZE + 12
-        self._name.setGeometry(left, body_y + 14, max(10, self._pin.x() - 4 - left), self._name.height())
+        name_right = body_x + body_w - 14 if self._plain else self._pin.x() - 4
+        self._name.setGeometry(left, body_y + 14, max(10, name_right - left), self._name.height())
         self._desc.setGeometry(left, body_y + 38, max(10, body_x + body_w - 14 - left), self._desc.height())
         self._status.move(left, body_y + CARD_BODY_H - 14 - self._status.height())
         self._place_tag()
@@ -349,14 +355,16 @@ class ToolCard(QWidget):
 
     def enterEvent(self, event) -> None:
         self._animate_to(1.0)
-        self._pin.show()
-        self._btn.setIcon(self._icons.icon("settings", theme.TEXT, 16))
+        if not self._plain:
+            self._pin.show()
+            self._btn.setIcon(self._icons.icon("settings", theme.TEXT, 16))
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._animate_to(0.0)
-        self._pin.setVisible(self.tool.pinned)
-        self._btn.setIcon(self._icons.icon("settings", theme.TEXT_MUTED, 16))
+        if not self._plain:
+            self._pin.setVisible(self.tool.pinned)
+            self._btn.setIcon(self._icons.icon("settings", theme.TEXT_MUTED, 16))
         self._pressed = False
         super().leaveEvent(event)
 
@@ -389,7 +397,7 @@ class ToolCard(QWidget):
         key = event.key()
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
             self.openRequested.emit(self.tool.id)
-        elif key == Qt.Key.Key_F2:
+        elif key == Qt.Key.Key_F2 and not self._plain:
             self.settingsRequested.emit(self.tool.id)
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down,
                      Qt.Key.Key_Home, Qt.Key.Key_End, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
@@ -402,6 +410,9 @@ class ToolCard(QWidget):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         menu.addAction("Open", lambda: self.openRequested.emit(self.tool.id))
+        if self._plain:
+            menu.exec(event.globalPos())
+            return
         menu.addAction("Unpin from the top" if self.tool.pinned else "Pin to the top",
                        lambda: self.pinRequested.emit(self.tool.id))
         menu.addAction("Open main.py in editor", lambda: self.editRequested.emit(self.tool.id))

@@ -847,6 +847,9 @@ class QueueDrawer(SlideDrawer):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(holder)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Always on: when the scrollbar came and went with the number of cells, the cards changed width as cells
+        # were deleted and everything under the pointer jumped during rapid deletion.
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         lay.addWidget(self.scroll, 1)
 
     # ------------------------------------------------------------------ binding to a session

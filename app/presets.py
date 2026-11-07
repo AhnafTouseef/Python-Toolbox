@@ -7,8 +7,8 @@ Each preset is one JSON file in the presets/ folder next to config.json:
                {"kind": "tool", "tool": "Render", "source": "", "label": "", "answers": ""}]}
 
 A preset holds cells only (never the Must Execute switch, never results or output). Tool cells name the tool by
-its folder name plus the folder it was found in (``source``: "" = the built-in tools/ folder), so a preset keeps
-working on another PC where an added folder lives somewhere else.  No Qt in here.
+its folder name plus the folder it was found in (``source``), so a preset keeps working on another PC where
+the folder lives somewhere else (an empty ``source`` just means "any folder").  No Qt in here.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class PresetCell:
     command: str = ""
     language: str = LANG_PYTHON
     tool: str = ""                  # tool folder name
-    source: str = ""                # folder the tool was found in ("" = built-in tools/)
+    source: str = ""                # folder the tool was found in ("" = unknown: match by name only)
     answers: str = ""
 
     def to_json(self) -> dict:

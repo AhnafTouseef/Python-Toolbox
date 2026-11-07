@@ -6,9 +6,9 @@ config.json lives next to app.py:
 
 `null` means "use the interpreter that is running the toolbox". Set it to the full
 path of a python.exe to use a different global interpreter for tools without a .venv.
-`tool_paths` lists extra folders to look for tools in (each holds tool folders, like tools/ does);
-the application's own tools/ folder is always searched first.  `pinned` lists the tools pinned to the top of the
-library (their ids: the folder name for tools/, the full folder path for tools of added folders).
+`tool_paths` lists the folders to look for tools in (each holds tool folders, i.e. folders with a main.py);
+nothing is built in, the user sets them.  `pinned` lists the tools pinned to the top of the library (a tool's
+id is its folder name, or its full folder path when an earlier folder already has a tool of that name).
 `tool_answers` maps a tool id to the predefined answers ("1920, 1080, yes") that new runs of that tool start with;
 an entry exists only for tools whose "Keep for this tool" box is ticked.
 """

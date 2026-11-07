@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageB
 from . import theme
 from .icon_manager import IconManager
 from .tool_card import CARD_BODY_H, GLOW, ToolCard
-from .tool_registry import ToolInfo, ToolRegistry
+from .tool_registry import WORKFLOWS_ID, ToolInfo, ToolRegistry, workflows_card_info
 
 log = logging.getLogger(__name__)
 
@@ -147,7 +147,6 @@ class LibraryView(QWidget):
     pinRequested = Signal(str)
     editRequested = Signal(str)
     foldersRequested = Signal()
-    workflowsRequested = Signal()
 
     def __init__(self, registry: ToolRegistry, icons: IconManager, status_provider: StatusProvider,
                  parent: QWidget | None = None):
@@ -157,6 +156,7 @@ class LibraryView(QWidget):
         self._icons = icons
         self._status_provider = status_provider
 
+        self._workflows = workflows_card_info()       # the first card of the library; not a tool
         self._items: list[ToolInfo] = []
         self._item_index: dict[str, int] = {}
         self._states: dict[str, RenderState] = {}
@@ -195,10 +195,6 @@ class LibraryView(QWidget):
         self._active_btn.setIcon(icons.icon("activity", theme.TEXT, 16))
         self._active_btn.setToolTip("Show running processes")
         self._active_btn.setAccessibleName("Active processes")
-        self._workflows_btn = QPushButton(" Workflows")
-        self._workflows_btn.setIcon(icons.icon("workflow", theme.TEXT, 16))
-        self._workflows_btn.setToolTip("Workflows: queues of code and tool cells that run on their own, without a tool")
-        self._workflows_btn.setAccessibleName("Workflows")
         self._notice = QLabel()
         self._notice.setStyleSheet(f"color: {theme.INFO}; font-size: 12px;")
         self._notice.setAccessibleName("Refresh result")
@@ -230,7 +226,6 @@ class LibraryView(QWidget):
         hl.addWidget(self._search, 2)
         hl.addWidget(self._refresh_btn)
         hl.addWidget(self._folders_btn)
-        hl.addWidget(self._workflows_btn)
         hl.addWidget(self._active_btn)
 
         self._banner = IssueBanner()
@@ -270,7 +265,6 @@ class LibraryView(QWidget):
         self._sb.valueChanged.connect(self._on_scroll)             # scroll => scheduling only
         self._search.textChanged.connect(self._on_search)
         self._active_btn.clicked.connect(self.activeRequested)
-        self._workflows_btn.clicked.connect(self.workflowsRequested)
         self._refresh_btn.clicked.connect(self.refreshRequested)
         self._folders_btn.clicked.connect(self.foldersRequested)
         QShortcut(QKeySequence(Qt.Key.Key_F5), self, self.refreshRequested.emit)
@@ -282,7 +276,7 @@ class LibraryView(QWidget):
     def reload(self) -> None:
         """(Re)read the tool list from the registry. Existing cards are kept when still valid."""
         self._banner.set_issues(self._registry.issues)
-        known = {t.id for t in self._registry.tools}
+        known = {t.id for t in self._registry.tools} | {WORKFLOWS_ID}
         for tid in [t for t in self._slots if t not in known]:
             self._drop_slot(tid)
         self._apply_filter(self._filter, reset_scroll=False)
@@ -311,7 +305,7 @@ class LibraryView(QWidget):
 
     @property
     def visible_tool_ids(self) -> list[str]:
-        return [t.id for t in self._items]
+        return [t.id for t in self._items if t.kind == "tool"]       # (the Workflows card is not a tool)
 
     def focus_search(self) -> None:
         self._search.setFocus()
@@ -337,29 +331,39 @@ class LibraryView(QWidget):
         self._anchor = None
         words = text.casefold().split()
         if words:
-            items = []
+            tools = []
             for t in self._registry.tools:
                 hay = f"{t.meta.name} {t.meta.description} {t.id}".casefold()
                 if all(w in hay for w in words):
-                    items.append(t)
+                    tools.append(t)
         else:
-            items = list(self._registry.tools)
-        items.sort(key=lambda t: not t.pinned)              # pinned tools first (stable: the order inside is unchanged)
+            tools = list(self._registry.tools)
+        tools.sort(key=lambda t: not t.pinned)              # pinned tools first (stable: the order inside is unchanged)
+        wf = self._workflows
+        wf_hay = f"{wf.meta.name} {wf.meta.description}".casefold()
+        items = ([wf] if all(w in wf_hay for w in words) else []) + tools      # the Workflows card is always first
         self._items = items
         self._item_index = {t.id: i for i, t in enumerate(items)}
         total = len(self._registry.tools)
-        self._count.setText(f"{total} tool{'s' if total != 1 else ''}" if len(items) == total
-                            else f"{len(items)} of {total}")
+        self._count.setText(f"{total} tool{'s' if total != 1 else ''}" if len(tools) == total
+                            else f"{len(tools)} of {total}")
         # Cards of filtered-out tools are hidden, not destroyed (identity is preserved).
         for tid, w in self._slots.items():
             if tid not in self._item_index and not w.isHidden():
                 w.hide()
-        if not items:
-            self._empty.setText("No tools found.\nAdd a folder with a main.py to the tools directory (or add another place with the folder button), then press Refresh."
-                                if not self._registry.tools else f"No tools match “{text}”.")
-        self._empty.setVisible(not items)
-        self._position_empty()
+        if not tools:
+            if self._registry.tools:
+                msg = f"No tools match “{text}”."
+            elif self._registry.dirs:
+                msg = ("No tools found in your tool folders.\nPut a folder with a main.py in one of them and press "
+                       "Refresh, or add another directory with the folder button at the top right.")
+            else:
+                msg = ("No tool folder is set yet.\nClick the folder button at the top right to add your own directory "
+                       "that contains your tool folders (each with a main.py).")
+            self._empty.setText(msg)
+        self._empty.setVisible(not tools)
         self._relayout(force=True, keep_position=not reset_scroll)
+        self._position_empty()
         if reset_scroll:
             self._sb.setValue(0)
 
@@ -385,7 +389,11 @@ class LibraryView(QWidget):
 
     def _position_empty(self) -> None:
         vp = self._scroll.viewport()
-        self._empty.setGeometry(24, 24, max(10, vp.width() - 48), 80)
+        y = 24
+        m = self._metrics
+        if m is not None and self._items:                  # below the Workflows card (it is there with no tools at all)
+            y = m.top + ((len(self._items) + m.cols - 1) // m.cols) * m.pitch + 16
+        self._empty.setGeometry(24, y, max(10, vp.width() - 48), 80)
 
     def _rect_for(self, idx: int, m: Metrics) -> QRect:
         row, col = divmod(idx, m.cols)
